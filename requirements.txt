@@ -1,0 +1,22 @@
+# 妮姬国服装备采集 —— 依赖清单
+#
+# 安装：
+#     pip install -r requirements.txt
+#
+# 注：界面（correct_gui.py）用的 tkinter 是 Python 标准库，不在本清单里。
+#     Windows 官方 Python 自带；Linux 上需另装（Debian/Ubuntu: apt install python3-tk）。
+
+# ── OCR 引擎 ────────────────────────────────────────────────
+# 中文识别用 RapidOCR（PP-OCRv3 中文模型已内置在包内，无需额外下载模型）
+rapidocr-onnxruntime>=1.2.3
+
+# ── 数值/图像处理 ───────────────────────────────────────────
+numpy>=1.24
+Pillow>=10.0
+
+# ── 查表（equipment.xlsx 的装备加成表 / 词条档位表）─────────
+openpyxl>=3.1
+
+# ── 仅「在线采集」需要（离线验证与校正界面用不到）──────────
+# collect_cn.py 里是延迟导入，不装也能跑 --offline / --check-state
+PyAutoGUI>=0.9.54

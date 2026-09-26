@@ -1,0 +1,31 @@
+# ── 采集产物 ────────────────────────────────────────────────
+# cn_collect.json / cn_collect.xlsx 及带时间戳的备份都在这里
+output/
+generated/
+
+# ── 本地标定截图（游戏内实拍，含账号信息，不入库）────────────
+# --offline / --check-state 默认读根目录这几张，可用 --ps/--eq
+# 指向自己的截图。想复现页面状态分类器校验，用
+# collect_cn.py --save-shots 在线跑一次，样本会落到已被忽略的
+# output/shots/，--check-state 会自动收进。
+/ps.png
+/PS-NE.png
+/NE.png
+/equipment.png
+/equipment-blue.png
+/equipment-black.png
+
+# ── 私有数据（本人账号的真实装备数据，不入库）────────────────
+/Nikke.xlsx
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ── 虚拟环境 / 编辑器 ───────────────────────────────────────
+.venv/
+venv/
+env/
+.idea/
+.claude/
