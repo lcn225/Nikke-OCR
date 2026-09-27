@@ -10,8 +10,9 @@
 
 界面是一张 31 列的大表，一行一个角色：
     姓名 | 战力 | 问题 | 头.等级 头1名 头1值 头2名 头2值 头3名 头3值 | 甲… | 手… | 脚…
-双击单元格进入编辑。姓名/词条名是下拉框（可自由输入），等级是只读下拉，数值接受
-`11.11%` 和 `0.1111` 两种写法（内部一律存小数）。
+双击单元格进入编辑。姓名/词条名是下拉框（可自由输入），等级和数值是只读下拉 —— 数值的
+候选就是**该行词条名对应的那 15 档**（`11.11%` 这种写法，内部一律存小数），选就行，不用
+记档位也打不错。词条名漏读时没有档位可查，退化成全局并集并提示一句（真正的解法是先定词条名）。
 
 可疑度按「要不要翻回游戏核实」分三级，底色 + 符号直接对应你下一步的动作：
     ▲ 橙底：必须看游戏才能定 —— 姓名图鉴查无此人、姓名多候选、战力缺失、战力违反降序、数值漏读
@@ -938,6 +939,18 @@ class CellEditor:
             ed.set(display)
             self._autofilter(ed, vals)
             w = 160
+        elif spec.kind == "pct":
+            vals, note = self._value_choices(view_r, spec, display)
+            ed = ttk.Combobox(grid.cv, state="readonly", values=vals)
+            ed.set(display)
+            if note:
+                self.app.flash(note)
+            # 只读下拉对 ↑/↓ 的原生处理各版本 Tk 不一（本地没有 tkinter 可实测），
+            # 索性自己接管：原地换一格、不弹列表，按 Enter 才落定。返回 break
+            # 就是为了压掉类绑定，行为完全确定。
+            ed.bind("<Up>", lambda e, c=ed, v=vals: self._cycle(c, v, -1))
+            ed.bind("<Down>", lambda e, c=ed, v=vals: self._cycle(c, v, 1))
+            w = 104
         else:
             ed = ttk.Entry(grid.cv)
             ed.insert(0, display)
@@ -950,7 +963,7 @@ class CellEditor:
         ed.bind("<Tab>", lambda e: self._commit_and_move(1, 0))
         ed.bind("<Shift-Tab>", lambda e: self._commit_and_move(-1, 0))
         ed.bind("<ISO_Left_Tab>", lambda e: self._commit_and_move(-1, 0))
-        if spec.kind not in ("level", "affixname", "text"):
+        if spec.kind not in ("level", "affixname", "text", "pct"):
             ed.bind("<FocusOut>", lambda e: self.finish(commit=True))
         else:
             # ⚠️ 下拉框的弹出列表也会触发 FocusOut。直接提交会把刚弹出来的候选列表
@@ -959,6 +972,47 @@ class CellEditor:
             ed.bind("<FocusOut>", lambda e, widget=ed: self.app.root.after(
                 90, lambda: self._focus_left(widget)))
         self.w, self.view_r, self.spec, self.orig = ed, view_r, spec, display
+
+    def _value_choices(self, view_r, spec, display):
+        """数值列的候选 = **同一个词条的 15 档**（不是全局大杂烩）。
+
+        候选直接是显示串（`11.11%`）而非小数：`equipment.xlsx` 里 15 档按 4 位小数
+        格式化后两两不重复（9 个词条都验过），所以拿显示串当选项不会串档，
+        也就省掉了「选项 -> 小数」这层映射。写回仍走 `parse_pct_input`。
+
+        返回 (候选, 需要提醒用户的一句话或 None)。
+        """
+        rid = self.app.grid.row_ids[view_r]
+        row = self.app.model.rows[rid]
+        slot = row.get(spec.slot) or {}
+        affs = slot.get("词条") or []
+        name = affs[spec.idx].get("名称") if spec.idx < len(affs) else None
+        table = self.app.model.affix_table or {}
+        note = None
+        if name == EMPTY_AFFIX:
+            levels = [0.0]              # 未获得效果：游戏里这格恒为 0
+        else:
+            levels = [float(v) for v in (table.get(name) or [])] if name else []
+            if not levels:
+                # 词条名漏读（或查不到档位）-> 没有档位可查。给全局并集兜底，免得
+                # 双击出来是个空下拉框；但真正的解法是先定词条名，所以说一声。
+                levels = sorted({float(v) for lv in table.values() for v in lv})
+                note = f"{spec.col_id} 词条名未定，档位取的是全局并集"
+        vals = [""] + [fmt_pct(v) for v in levels]
+        if display and display not in vals:
+            vals.append(display)   # 现值越档时也留在列表里，set() 才不会落空
+        return vals, note
+
+    @staticmethod
+    def _cycle(combo, values, step):
+        """↑/↓ 在候选里挪一格。只改显示不落定，Enter/Tab 才提交（同普通编辑器）。"""
+        cur = combo.get()
+        try:
+            i = values.index(cur)
+        except ValueError:
+            i = 0 if step > 0 else len(values) - 1
+        combo.set(values[(i + step) % len(values)])
+        return "break"
 
     def _focus_left(self, widget):
         """焦点离开 -> 提交。两条「别急着关」的护栏都是实测踩出来的：
