@@ -7,6 +7,13 @@
     python correct_gui.py --file X.json   换文件
     python correct_gui.py --report        不开窗，只打印校验基线（无 tkinter 的机器也能跑）
     python correct_gui.py --roundtrip     读入→原样写出→读回，验证明细零丢失、格式零改动
+    python correct_gui.py --merge-preview 不开窗，只打印增量补丁会怎么合并（干跑，不写文件）
+
+增量补丁：`collect_cn.py --patch` 产出 output/cn_patch.json（**主数据一个字节都不动**）。
+界面顶部「合并补丁 (N)」按钮逐条确认「并到哪一行」之后才并进主数据，合并后按战力重排。
+补丁行同名精确命中时默认就指向那一行；没有候选时默认「追加为新角色」——错了也只是多一行，
+不会把别人的数据覆盖掉。补丁里为空、而旧行有值的槽默认**保留旧值**（空到底是 T9 真值
+还是没读到，光看补丁分辨不了），要覆盖得逐条勾「空槽也覆盖」。
 
 界面是一张 31 列的大表，一行一个角色：
     姓名 | 战力 | 问题 | 头.等级 头1名 头1值 头2名 头2值 头3名 头3值 | 甲… | 手… | 脚…
@@ -37,6 +44,7 @@ load_affix_table / save_rows / archive_previous 各留一份 —— 三者都极
 """
 
 import argparse
+import copy
 import difflib
 import json
 import os
@@ -58,6 +66,7 @@ GUI_SLOTS = ("头", "甲", "手", "脚")
 ROSTER_PATH = "docs/chacters.json"
 EQUIP_XLSX = "equipment.xlsx"
 DEFAULT_JSON = "output/cn_collect.json"
+DEFAULT_PATCH = "output/cn_patch.json"   # collect_cn.py --patch 的产物，见「补丁合并」一节
 
 # 与 collect_cn.py 保持一致（见文件头说明）。空词条占位是游戏里的原文，
 # 采集端也拿它当「这块是 T10」的铁证。
@@ -450,6 +459,125 @@ def slot_is_stale(slot):
     )
 
 
+# ----------------------------------------------------------------------------
+# 补丁合并（纯函数，不依赖 tkinter）
+# ----------------------------------------------------------------------------
+# collect_cn.py --patch 写出的 output/cn_patch.json，只经这里并进主数据，而且**每条都要人工确认**：
+# 补丁行的姓名本身就是 OCR 或 --as 断言的产物，机器认错了就是把别人的装备覆盖到另一个人头上。
+def merge_candidates(patch_name, rows, roster):
+    """补丁行的姓名 -> (候选旧行下标列表（最像的在前）, 一句话理由)。
+
+    先精确同名（归一化后），再退回图鉴姓名候选。**只给候选，不替用户决定** ——
+    补丁姓名本身可能就是截断或读错，猜错了代价是覆盖掉另一个人的数据。
+    """
+    nm = norm_roster_name(patch_name or "")
+    if not nm:
+        return [], "补丁里没有姓名"
+    exact = [i for i, r in enumerate(rows) if norm_roster_name(r.get("姓名") or "") == nm]
+    if exact:
+        return exact, "姓名精确命中"
+    if not roster:
+        return [], "图鉴未载入，无法给姓名候选"
+    wanted = {norm_roster_name(c) for c in name_candidates(nm, roster)}
+    hits = [i for i, r in enumerate(rows) if norm_roster_name(r.get("姓名") or "") in wanted]
+    return (hits, "姓名相近（需人工确认）") if hits else ([], "没有相近的名字，需人工指定")
+
+
+def empty_patch_slots(patch_row, old_row):
+    """补丁里「空」、而旧行非空的槽。
+
+    **空到底是 T9 的真值，还是这次没读到？光看补丁分辨不了** —— T9 本来就没词条，
+    空是对的；而读失败也是空。所以这些槽默认保留旧值，要覆盖得用户显式勾选：
+    别把「这次扫到了空」当成「这次更准」。
+    """
+    return [s for s in GUI_SLOTS
+            if slot_is_stale(patch_row.get(s) or {}) and not slot_is_stale(old_row.get(s) or {})]
+
+
+def merge_row(old_row, patch_row, empty_over=False):
+    """把补丁行并进旧行（**原地改 old_row**）。返回 [说明]。
+
+    三条保守规则 —— 姓名、空槽、战力一律「宁可留旧值」：
+      * 姓名永远是**旧行的**：合并的前提就是「确认这是同一个人」，改名是另一回事。
+      * 空槽默认保留旧值（见 empty_patch_slots），empty_over=True 才用空覆盖。
+      * 战力没读到（None）时同样保留旧值。
+    """
+    notes = []
+    for s in GUI_SLOTS:
+        if slot_is_stale(patch_row.get(s) or {}) and not empty_over:
+            if not slot_is_stale(old_row.get(s) or {}):
+                notes.append(f"{s} 补丁为空，保留旧值")
+            continue
+        old_row[s] = copy.deepcopy(patch_row.get(s) or empty_slot())
+    cp = patch_row.get("战力")
+    if cp is None:
+        if old_row.get("战力") is not None:
+            notes.append("战力没读到，保留旧值")
+    else:
+        old_row["战力"] = cp
+    return notes
+
+
+def sort_by_cp(rows):
+    """按战力降序（缺战力的排最后）。游戏名册就是这个序。
+
+    ⚠️ 合并后**必须重排**：覆盖战力会让它在降序里的位置漂，不重排就是凭空造出一处
+    「战力违反降序」，而 check_cp_order 是**成对标记相邻两行**的，会连累邻居一起报警。
+    重排会让序号漂移 —— 所以确定目标行要在重排**之前**用行身份定好，之后不能再按序号引。
+    """
+    rows.sort(key=lambda r: (r.get("战力") is None, -(r.get("战力") or 0)))
+
+
+def apply_patch(rows, patch_rows, decisions):
+    """按 decisions 把补丁并进 rows（**原地**，重排由调用方做）。返回 (新增数, 覆盖数, [说明])。
+
+    decisions: {补丁行下标: (目标旧行下标, 空槽是否覆盖)}；**不在里面的按跳过处理**，
+    目标下标为 None 表示「作为新角色追加」。
+    """
+    added = over = 0
+    notes = []
+    for i, pr in enumerate(patch_rows):
+        if i not in decisions:
+            continue
+        target, empty_over = decisions[i]
+        name = pr.get("姓名") or "(空)"
+        if target is None:
+            rows.append(copy.deepcopy(pr))
+            added += 1
+            notes.append(f"[{i + 1}] {name}：追加为新角色")
+            continue
+        if not 0 <= target < len(rows):
+            notes.append(f"[{i + 1}] {name}：目标行 {target} 越界，已跳过")
+            continue
+        ns = merge_row(rows[target], pr, empty_over)
+        over += 1
+        notes.append(f"[{i + 1}] {name} → 覆盖 #{target + 1} {rows[target].get('姓名') or '(空)'}"
+                     + (f"（{'；'.join(ns)}）" if ns else ""))
+    return added, over, notes
+
+
+def merge_preview(main_path, patch_path):
+    """干跑：打印每条补丁会怎么合并（**不写任何文件**）。没装 tkinter 的机器也能跑。"""
+    if not Path(patch_path).exists():
+        print(f"没有补丁文件：{patch_path}")
+        return 1
+    m = build_model(main_path, verbose=False)
+    prows, notes = load_rows(patch_path)
+    print(f"主数据 {main_path}：{len(m.rows)} 行")
+    print(f"补丁   {patch_path}：{len(prows)} 行" + (f"（结构异常 {len(notes)} 处）" if notes else ""))
+    print("\n=== 逐条建议（真合并时以界面里的选择为准）===")
+    for i, pr in enumerate(prows):
+        cands, why = merge_candidates(pr.get("姓名"), m.rows, m.roster)
+        print(f"  [{i + 1}] {pr.get('姓名') or '(空)'}  战力 {pr.get('战力')}  —— {why}")
+        for t in cands[:3]:
+            amb = empty_patch_slots(pr, m.rows[t])
+            print(f"        → #{t + 1} {m.rows[t].get('姓名') or '(空)'}（战力 {m.rows[t].get('战力')}）"
+                  + (f"  ⚠ 空槽歧义：{'/'.join(amb)}（默认保留旧值）" if amb else ""))
+        if not cands:
+            print("        → 无候选：界面里默认「追加为新角色」，也可以手动选一行覆盖")
+    return 0
+
+
 def check_row(row, affix_table, name_counts, roster):
     """一行的全部问题 -> [Prob]。short 带位置，col 指到出问题的那一列。"""
     probs = list(check_name(row.get("姓名"), roster))
@@ -636,6 +764,10 @@ def report(path):
             continue
         print(f"  #{i + 1:>3} {m.rows[i].get('姓名') or '(空)':<12} {SYM[m.level_of(i)]} "
               + " | ".join(p.short for p in probs))
+    if Path(DEFAULT_PATCH).exists():
+        prows, _ = load_rows(DEFAULT_PATCH)
+        print(f"\n=== 增量补丁 ===\n  {DEFAULT_PATCH}：{len(prows)} 条等待合并"
+              f"（开界面点「合并补丁」，或先 --merge-preview 干跑看一眼）")
     print("\n=== 与 collect_cn 的一致性 ===")
     check_consistency()
     return m
@@ -1078,13 +1210,166 @@ class CellEditor:
 
 
 # ----------------------------------------------------------------------------
+# 补丁合并审阅窗
+# ----------------------------------------------------------------------------
+MERGE_APPEND = "（追加为新角色）"
+
+
+class MergeWindow:
+    """逐条审阅 output/cn_patch.json 怎么并进主数据。
+
+    一条补丁一个块：姓名/战力/四槽摘要 + 目标下拉（最像的旧行排最前，最后是全部旧行，
+    首项是「追加为新角色」）+「空槽也覆盖」勾选框。
+
+    ⚠️ 刻意不复用主界面那张 31 列大表：补丁只有几条，而这里要表达的两件事 ——
+    「并到哪一行」和「空槽算不算真值」——都塞不进那 31 列；何况合并必须在**任何写入之前**
+    逐条确认，而主表是「编辑即改模型」的。
+    """
+
+    def __init__(self, app, patch_path, patch_rows):
+        self.app = app
+        self.patch_path = patch_path
+        self.patch_rows = patch_rows
+        self.states = []          # [(目标 StringVar, 空槽覆盖 BooleanVar)]
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title(f"合并补丁 — {patch_path}")
+        self.win.transient(app.root)
+        self.win.geometry("980x640")
+        self.win.minsize(720, 360)
+
+        head = ttk.Frame(self.win, padding=(8, 8, 8, 2))
+        head.pack(fill="x")
+        ttk.Label(head, text=f"主数据 {app.path}：{len(app.model.rows)} 行　→　"
+                             f"补丁 {patch_path}：{len(patch_rows)} 条").pack(anchor="w")
+        ttk.Label(head, foreground="#666", text="合并前请逐条确认「并到哪一行」；"
+                                               "不确定就选「追加为新角色」，主数据不会被改错。"
+              ).pack(anchor="w")
+
+        body = ttk.Frame(self.win)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+        cv = tk.Canvas(body, highlightthickness=0)
+        sb = ttk.Scrollbar(body, orient="vertical", command=cv.yview)
+        inner = ttk.Frame(cv)
+        wid = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        # 画布窗口默认只有内容宽度，块会挤成一条；跟着画布宽度走才能 fill="x" 铺满
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(wid, width=e.width))
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        cv.bind("<MouseWheel>", lambda e: cv.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        for i, pr in enumerate(patch_rows):
+            self._add_block(inner, i, pr)
+
+        bar = ttk.Frame(self.win, padding=(8, 4, 8, 8))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="应用并写入主数据", command=self.apply).pack(side="left")
+        ttk.Button(bar, text="取消", command=self.win.destroy).pack(side="left", padx=8)
+
+    # -- 单条 -----------------------------------------------------------------
+    def _row_label(self, idx):
+        r = self.app.model.rows[idx]
+        cp = r.get("战力")
+        # 前缀 #序号 保证标签唯一（重名时也不会有两条一样的选项）
+        return f"#{idx + 1} {r.get('姓名') or '(空)'}（战力 {cp if cp is not None else '缺失'}）"
+
+    def _add_block(self, parent, i, pr):
+        lf = ttk.LabelFrame(parent, text=f"补丁第 {i + 1} 条", padding=(8, 4))
+        lf.pack(fill="x", pady=4)
+
+        cands, why = merge_candidates(pr.get("姓名"), self.app.model.rows, self.app.model.roster)
+        order = cands + [t for t in range(len(self.app.model.rows)) if t not in cands]
+        labels = [MERGE_APPEND] + [self._row_label(t) for t in order]
+        label2idx = {lab: t for lab, t in zip(labels[1:], order)}
+
+        top = ttk.Frame(lf)
+        top.pack(fill="x")
+        cp = pr.get("战力")
+        ttk.Label(top, text=f"{pr.get('姓名') or '(空)'}　战力 {cp if cp is not None else '缺失'}　",
+                  font=("", 10, "bold")).pack(side="left")
+        ttk.Label(top, text=self._slot_summary(pr), foreground="#444").pack(side="left")
+
+        pick = ttk.Frame(lf)
+        pick.pack(fill="x", pady=(2, 0))
+        ttk.Label(pick, text="并到：").pack(side="left")
+        var = tk.StringVar(value=labels[1] if cands else MERGE_APPEND)
+        cb = ttk.Combobox(pick, state="readonly", values=labels, textvariable=var, width=44)
+        cb.pack(side="left")
+        over = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pick, text="空槽也覆盖", variable=over).pack(side="left", padx=8)
+        ttk.Label(pick, text=f"（{why}）", foreground="#8a6d00").pack(side="left")
+
+        note = ttk.Label(lf, text="", foreground="#b00020")
+        note.pack(anchor="w")
+
+        def refresh(*_a):
+            t = label2idx.get(var.get())
+            if t is None:
+                note.configure(text="作为新角色追加到末尾 —— 主数据里已有的行一条都不会动。",
+                               foreground="#222222")
+                return
+            amb = empty_patch_slots(pr, self.app.model.rows[t])
+            if amb:
+                note.configure(text=f"⚠ 空槽歧义：{'、'.join(amb)} 在补丁里是空的，而旧行有值 ——"
+                                    f"空到底是 T9 真值还是没读到，光看补丁分辨不了。"
+                                    f"默认**保留旧值**；确定是真 T9 才勾「空槽也覆盖」。",
+                               foreground="#b00020")
+            else:
+                note.configure(text="该行没有空槽歧义。", foreground="#666666")
+
+        cb.bind("<<ComboboxSelected>>", refresh)
+        refresh()
+        self.states.append((var, over))
+
+    @staticmethod
+    def _slot_summary(row):
+        bits = []
+        for s in GUI_SLOTS:
+            slot = row.get(s) or {}
+            if slot_is_stale(slot):
+                bits.append(f"{s} 空")
+                continue
+            n = sum(1 for a in (slot.get("词条") or [])
+                    if a.get("名称") and a.get("名称") != EMPTY_AFFIX)
+            lv = slot.get("等级")
+            bits.append(f"{s} Lv{lv if lv is not None else '?'}/{n}条")
+        return " | ".join(bits)
+
+    # -- 应用 -----------------------------------------------------------------
+    def apply(self):
+        decisions, skip = {}, 0
+        for i, (var, over) in enumerate(self.states):
+            label = var.get()
+            if label == MERGE_APPEND:
+                decisions[i] = (None, False)
+                continue
+            try:
+                idx = int(label.split()[0].lstrip("#")) - 1
+            except (ValueError, IndexError):
+                skip += 1
+                continue
+            decisions[i] = (idx, bool(over.get()))
+        added = sum(1 for t, _o in decisions.values() if t is None)
+        over_n = len(decisions) - added
+        tail = f"、跳过 {skip} 条" if skip else ""
+        if not messagebox.askyesno("确认合并", f"将追加 {added} 条、覆盖 {over_n} 条{tail}。\n"
+                                              f"主数据 {self.app.path} 会先留底再写入。继续？"):
+            return
+        if self.app.merge_apply(self.patch_path, self.patch_rows, decisions):
+            self.win.destroy()
+
+
+# ----------------------------------------------------------------------------
 # 主界面
 # ----------------------------------------------------------------------------
 class App:
-    def __init__(self, root, model, path):
+    def __init__(self, root, model, path, patch_path=DEFAULT_PATCH):
         self.root = root
         self.model = model
         self.path = path
+        self.patch_path = patch_path
         self.dirty = False
         self.archived = False
         self.backup = None
@@ -1109,6 +1394,9 @@ class App:
         ttk.Button(bar, text="保存 JSON", command=self.save).pack(side="left")
         ttk.Label(bar, text="(Ctrl+S)").pack(side="left", padx=(2, 10))
         ttk.Button(bar, text="重新载入", command=self.reload).pack(side="left", padx=(0, 12))
+        self.merge_btn = ttk.Button(bar, text="合并补丁 …", command=self.open_merge)
+        self.merge_btn.pack(side="left", padx=(0, 12))
+        self._update_merge_btn()
         ttk.Label(bar, text="显示：").pack(side="left")
         self.filter_var = tk.StringVar(value="all")
         for val, text in (("all", "全部"), ("suspect", "只看 ▲"), ("both", "只看 ▲+!")):
@@ -1273,7 +1561,66 @@ class App:
         self.archived = False
         self.rerender()
         self.hint.configure(text=self.hint_text())
+        self._update_merge_btn()
         self.refresh_status()
+
+    # -- 补丁合并 -------------------------------------------------------------
+    def _patch_rows(self):
+        """补丁文件存在且非空时返回它的行，否则 None。每次都重读：补丁是外部产物。"""
+        if not Path(self.patch_path).exists():
+            return None
+        rows, _notes = load_rows(self.patch_path)
+        return rows or None
+
+    def _update_merge_btn(self):
+        rows = self._patch_rows()
+        self.merge_btn.configure(state="normal" if rows else "disabled",
+                                 text=f"合并补丁 ({len(rows)}) …" if rows else "合并补丁 …")
+
+    def open_merge(self):
+        self.editor.finish(True)
+        rows = self._patch_rows()
+        if not rows:
+            self.flash(f"没有补丁（{self.patch_path}）—— 先跑 "
+                       f"python collect_cn.py --patch --max N", "info")
+            self._update_merge_btn()
+            return
+        if self.dirty:
+            # 合并会把模型整份重写并重载，未保存的手改会一起没掉 —— 先落盘，别默默丢
+            if not messagebox.askyesno("先保存", "当前有未保存的修改。先保存再合并？"):
+                return
+            self.save()
+            if self.dirty:      # save() 在「还有 ▲ 项」那一步被取消掉了
+                return
+        # 留住引用：Toplevel 本身由 tk 的对象树保活，但 Python 侧的 MergeWindow 实例
+        # 只被按钮 command / 闭包引用着，显式留一份最不容易踩坑
+        self._merge_win = MergeWindow(self, self.patch_path, rows)
+
+    def merge_apply(self, patch_path, patch_rows, decisions):
+        """执行合并：改模型 -> 按战力重排 -> 主数据留底后写入 -> 退掉补丁文件 -> 重载。
+
+        返回是否成功。**先重排再写盘**：补丁换了战力，不重排就是造一处假的「违反降序」。
+        """
+        added, over, notes = apply_patch(self.model.rows, patch_rows, decisions)
+        sort_by_cp(self.model.rows)
+        try:
+            self.backup = archive_previous(self.path)
+            save_rows(self.model.rows, self.path)
+        except Exception as e:
+            messagebox.showerror("写盘失败", f"{type(e).__name__}: {e}\n"
+                                             f"（模型已改但没落盘，重载即可回到磁盘上的状态）")
+            return False
+        self.archived = True
+        retired = archive_previous(patch_path)   # 退掉补丁，防手滑再合并一次
+        self.dirty = False
+        self.load_from_disk()
+        messagebox.showinfo("合并完成", "\n".join(notes) +
+                            f"\n\n主数据：{self.path}（原文件留底：{self.backup or '无旧数据'}）"
+                            f"\n补丁已退成：{retired or patch_path}"
+                            f"\n（如需再合并，重新跑一次采集生成新补丁）")
+        self.flash(f"合并完成：新增 {added} 覆盖 {over} "
+                   f"跳过 {len(patch_rows) - added - over}", "info")
+        return True
 
     def hint_text(self):
         bits = []
@@ -1325,8 +1672,12 @@ class App:
 def main():
     ap = argparse.ArgumentParser(description="妮姬采集结果校正界面")
     ap.add_argument("--file", default=DEFAULT_JSON, help=f"要校正的 JSON（默认 {DEFAULT_JSON}）")
+    ap.add_argument("--patch", default=DEFAULT_PATCH,
+                    help=f"增量补丁文件（默认 {DEFAULT_PATCH}，有它才会出现「合并补丁」按钮）")
     ap.add_argument("--report", action="store_true", help="不开窗，只打印校验基线")
     ap.add_argument("--roundtrip", action="store_true", help="读入→原样写出→读回，验证零丢失")
+    ap.add_argument("--merge-preview", action="store_true",
+                    help="不开窗，只打印补丁会怎么合并（干跑，不写任何文件）")
     args = ap.parse_args()
 
     # 所有相对路径（output/、equipment.xlsx、docs/）都依赖 cwd，先切到脚本目录
@@ -1337,6 +1688,8 @@ def main():
         return 0
     if args.roundtrip:
         return 0 if roundtrip(args.file) else 1
+    if args.merge_preview:
+        return merge_preview(args.file, args.patch)
 
     if tk is None:
         print("这台机器没有 tkinter，界面起不来。可以先用 --report 看校验结果。")
@@ -1353,7 +1706,7 @@ def main():
         model = build_model(args.file, verbose=False)
         boot.destroy()
         root.deiconify()
-        App(root, model, args.file)
+        App(root, model, args.file, args.patch)
         root.mainloop()
     finally:
         try:

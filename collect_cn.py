@@ -16,6 +16,19 @@
 输出：output/cn_collect.json —— 每角色一行：姓名、战力、头/身/手/足 各{等级, 词条[3]}。
       开跑前会把上一轮的这个文件改名加时间戳留底（cn_collect.<YYYYMMDD-HHMMSS>.json），
       避免新一轮直接覆盖掉上一轮的结果。
+
+姓名怎么定的：读到的名字是**滚动横幅**的截帧，实测约四成会截断读错，而且最险的一种错是
+「截断后恰好等于另一个真实角色」——那种错在 correct_gui 里是**零告警**的。所以每行还会读
+信息页下方**四个静态图标**（属性/武器/职业/企业，逐像素稳定），拿四维去图鉴里筛人：
+图标唯一命中、或与姓名候选交成唯一，才敢用图标定下来的名字；其余一律保持 OCR 原名并告警。
+
+增量（升级了少数角色的装备后，不必全量重扫）：
+    python collect_cn.py --max 3 --as "红莲：暗影,桃乐丝,阿妮斯"
+  先在游戏里手动翻到第一个要重扫的角色，再跑；结果写 output/cn_patch.json，
+  **主数据一个字节都不动**，之后开 correct_gui.py 走「合并补丁」逐条确认才并进去。
+  采集侧没有跳转能力（只有点「>>」逐格前进一条路），所以"翻到哪儿"由你在游戏里决定。
+  --as 按扫描顺序断言身份：屏幕没读到名字、或只读到截图横幅的截断名时，用它修正；
+  明显不符（停错格子/翻页没完成）则**保留屏幕读到的名字**并响亮告警，不拿断言名去盖。
 词条规范名取 9 个游戏内名称（都带「增加」）；数值为百分比小数(11.81% → 0.1181)。
 T9/T10 判定：装备页读到词条即 T10，无词条即 T9（词条留空）。
 """
@@ -30,6 +43,11 @@ import numpy as np
 import openpyxl
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
+
+# 复用 correct_gui 的「姓名 -> 图鉴候选」逻辑，不重写一份。它是纯函数、不依赖 tkinter
+# （correct_gui 把 tkinter 的 import 包在 try 里），而且那边只在 --report 里**延迟** import
+# 本模块，所以不会成环。反过来这里 import 它，只是拿模型层的两个工具函数。
+from correct_gui import load_roster, name_candidates
 
 # ----------------------------------------------------------------------------
 # 坐标常量（1920x1080 全屏，官方 PC 客户端；像素分析 + 模板匹配标定）
@@ -497,8 +515,10 @@ def _read_affix_values(engine, img, name_rows, table, dy=0):
 TYPE_BOX = (735, 45, 825, 92)
 STAT_BOX = (860, 520, 1045, 600)       # 装备能力值面板（左标签列 右数值列）
 EQUIP_XLSX = "equipment.xlsx"
-ONLINE_OUT = "output/cn_collect.json"         # 在线采集结果
+ONLINE_OUT = "output/cn_collect.json"         # 在线采集结果（全量）
 OFFLINE_OUT = "output/cn_collect_offline.json"  # 离线自检结果（独立文件，不覆盖真实结果）
+PATCH_OUT = "output/cn_patch.json"              # 增量补丁（--patch）；**绝不直接改主数据**
+ROSTER_PATH = "docs/chacters.json"              # 图鉴（姓名 -> 属性/企业/武器/职业），只拿姓名当名单
 
 _TYPES = ["火力型", "辅助型", "防御型"]
 _SLOT_ALIAS = {"头": "头", "手": "手", "甲": "甲", "衣": "甲", "脚": "脚", "鞋": "脚"}
@@ -805,6 +825,249 @@ def _empty_slot():
 
 
 # ----------------------------------------------------------------------------
+# 身份断言（--as）：人就在游戏里看着屏幕，比任何机器判定都可靠
+# ----------------------------------------------------------------------------
+def norm_name(s):
+    """姓名归一化：去空白 + 半角 ':' 统一成全角 '：'。
+
+    图鉴和游戏横幅都用全角，但手打 --as 常打半角；不统一的话「红莲:暗影」永远对不上。
+    """
+    return re.sub(r"\s+", "", str(s or "")).replace(":", "：")
+
+
+def name_matches(ocr_name, want):
+    """OCR 读到的名与断言的名是否「不算明显不符」。**读不到名字时返回 True**（无从比对，不冤枉）。
+
+    姓名区是滚动横幅，截帧天然会截断，所以**子串和子序列都算合理**
+    （「红莲」/「红暗」都可能是「红莲：暗影」的截帧）。真正要抓的是「停错格子 / 翻页没完成」——
+    那种情况下两个名字几乎不可能有包含关系。
+    """
+    if not ocr_name or not want:
+        return True
+    o, w = norm_name(ocr_name), norm_name(want)
+    if o == w or o in w or w in o:
+        return True
+    it = iter(w)
+    return all(c in it for c in o)  # o 是 w 的子序列
+
+
+def load_roster_names(path=ROSTER_PATH):
+    """图鉴里的姓名集合。**只取 key 当名单**，值（属性/企业/武器/职业）这里用不到。
+
+    与 correct_gui.load_roster 同口径。读不到返回 None（不阻断采集，只是关掉这道校验）。
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {norm_name(k) for k in raw} if isinstance(raw, dict) and raw else None
+
+
+# ----------------------------------------------------------------------------
+# 信息页那四个图标：抠图 -> 匹配 -> 级联定名
+# ----------------------------------------------------------------------------
+# 为什么要有这一套：姓名读的是游戏里的**滚动横幅**，截帧天然会截断，实测约四成读错。
+# 最险的一种错是「截断后恰好等于另一个真实角色」—— 那种错在 correct_gui 里是**零告警**的
+# （`check_name` 第一句就是「名字在图鉴里就返回无问题」），于是会静默把别人的装备并到
+# 另一个人头上。信息页下方那四个图标是静态资源、逐像素稳定，是**和姓名完全无关**的独立判据。
+ICON_DIMS = ["属性", "武器", "职业", "企业"]   # 同时也是图鉴里的字段名（游戏里叫「妮姬类型」的那维，图鉴叫「职业」）
+ICON_TILE = (24, 20)                          # 模板与样本都降采样到这个尺寸再比（实测零损失）
+ICON_TEMPLATES = "docs/icon_templates.png"    # 模板图：4 行 x 6 列，每格 ICON_TILE
+
+# 抠图框（1920x1080 绝对坐标，实测定死）。四条都别随手放宽：
+#   * 四个图标的 x 在 31 张样本里**逐像素一致**，所以框可以贴紧字形。
+#   * **武器框 y0 必须 >= 608** —— 正上方 y593~607 有一行**随角色变化**的文字。切进去就等于把
+#     一个「随名字变的东西」当成了图标特征，判别力被静默拉低，而且看不出是谁的错。
+#   * 职业/企业的 y1 停在字形底（658 / 660）：再往下一行是 `LV.xxx`，那个数字每次都会变。
+#   * 企业框贴到字形（32px 宽），不是原来凭感觉给的 55px —— 原框六成是空白面板，把类间距离
+#     稀释掉三分之二（实测最优/次优间隔因此从 30x 掉到 7~9x）。
+ICON_BOXES = {
+    "属性": (1595, 621, 1647, 675),
+    "武器": (1659, 620, 1713, 665),
+    "职业": (1740, 622, 1766, 658),
+    "企业": (1810, 625, 1838, 660),
+}
+# 每个维度的取值。**顺序必须与模板图里的列一致**（重建模板用 build_icon_templates.py）。
+# 「超规格极乐净土」是游戏里真实存在的第 6 种企业图标（同一家企业的超规格版，中心十字是空心
+# 的，与普通版只差 4.6 —— 而不同企业之间差 14~19），但图鉴的 `企业` 字段里没有这回事，
+# 所以匹配图鉴时靠 ICON_ALIAS 折回去。
+ICON_VALUES = {
+    "属性": ["水冷", "燃烧", "电击", "铁甲", "风压"],
+    "武器": ["冲锋枪", "发射器", "机枪", "步枪", "狙击步枪", "霰弹枪"],
+    "职业": ["火力型", "辅助型", "防御型"],
+    "企业": ["反常", "朝圣者", "极乐净土", "泰特拉", "米西利斯", "超规格极乐净土"],
+}
+ICON_ALIAS = {"超规格极乐净土": "极乐净土"}   # 图标值 -> 图鉴值；不在表里的原样用
+# 「这次匹配算不算可信」的判据：最优距离必须 < 0.75 x 次优。用**相对**值而不是绝对阈值 ——
+# 四个维度的距离尺度差好几倍（职业的类间距离 20+，属性只有 5 上下），一个绝对阈值必然在
+# 某一维上过松、另一维上过紧。0.75 是拿 31 张真实截图回归出来的：**一个正确的匹配都没误杀**。
+ICON_MARGIN = 0.75
+
+_ICON_TPL = None
+
+
+def load_icon_templates(path=ICON_TEMPLATES, tile=ICON_TILE):
+    """读模板图 -> {维度: {值: 灰度 ndarray}}。首次调用解析一次，之后走缓存。
+
+    ⚠️ 读不到就**直接报错退出**，绝不照抄 load_roster_names 那种「返回 None、不阻断采集」的
+    容错 —— 模板缺失的后果是**每一行都静默退回 OCR 原名**，而那正是这套东西要防的事。
+    一次扫描 30 分钟，必须在开跑前就报错。
+
+    路径走 `__file__` 而不是 cwd：本模块的 main() 从不 chdir，`python collect_cn.py` 从别处
+    调用时 cwd 是调用者目录，相对路径会找不到（equipment.xlsx 那几个老相对路径同样脆弱，
+    但那是既有行为，这里不跟着踩）。
+    """
+    global _ICON_TPL
+    if _ICON_TPL is not None:
+        return _ICON_TPL
+    p = Path(__file__).resolve().parent / path
+    if not p.exists():
+        raise SystemExit(f"找不到图标模板：{p}\n"
+                         f"它随仓库提供；要从截图重建请跑 build_icon_templates.py。")
+    img = np.asarray(Image.open(p).convert("L"), dtype=float)
+    tw, th = tile
+    need = (tw * max(len(v) for v in ICON_VALUES.values()), th * len(ICON_DIMS))
+    if img.shape[0] < need[1] or img.shape[1] < need[0]:
+        raise SystemExit(f"图标模板尺寸不对：{p} 是 {img.shape[1]}x{img.shape[0]}，"
+                         f"至少要 {need[0]}x{need[1]}（{len(ICON_DIMS)} 行 x 每行最多 "
+                         f"{max(len(v) for v in ICON_VALUES.values())} 列，每格 {tw}x{th}）。")
+    _ICON_TPL = {dim: {val: img[r * th:(r + 1) * th, c * tw:(c + 1) * tw]
+                       for c, val in enumerate(ICON_VALUES[dim])}
+                 for r, dim in enumerate(ICON_DIMS)}
+    return _ICON_TPL
+
+
+def read_icon_tiles(img):
+    """信息页截图 -> {维度: 降采样后的灰度块}。纯裁剪，不比对、不 OCR（整轮约 1ms）。"""
+    out = {}
+    for dim, box in ICON_BOXES.items():
+        out[dim] = np.asarray(img.crop(box).convert("L").resize(ICON_TILE, Image.BOX), dtype=float)
+    return out
+
+
+def match_icons(tiles, tpl):
+    """{维度: 灰度块} -> {维度: (值 或 None, 是否可信)}。
+
+    逐格算平均绝对差取最小，再用上面那条相对判据定「可信」。**认不准就返回 None，绝不硬猜** ——
+    认错的代价是把别人的装备并到另一个人头上，比「认不出、退回原名」严重得多。
+    """
+    out = {}
+    for dim, a in tiles.items():
+        scored = sorted((np.abs(a - t).mean(), v) for v, t in tpl[dim].items())
+        best, dist = scored[0][1], scored[0][0]
+        second = scored[1][0] if len(scored) > 1 else float("inf")
+        out[dim] = (best, True) if dist < ICON_MARGIN * second else (None, False)
+    return out
+
+
+def read_icons_stable(screen, img, tpl, verify=False, tries=3, wait=0.15):
+    """读四个图标 -> {维度: (值, 可信)}。verify=True 时要求**两帧的判定结论一致**才认。
+
+    ⚠️ 比对的是**匹配出来的值**，不是像素。一开始写成比像素（容差 1.0），**真机上每一行都被判
+    「两帧不一致」**——信息页上有会动的东西（滚动横幅、立绘、高亮），像素级永远对不上，等于
+    把这套功能整个关掉。而真正该问的是「两次独立读数会不会得出同一个人」：结论一致就说明画面
+    已经定下来了，那点像素噪声根本不影响匹配（同值类内距离 ~1.5，不同值之间 14~19）。
+
+    为什么还要这一道：`page_state` 判「信息页」只看外圈亮度、**不看内容**，而 `wait_page_turn`
+    用战力（CP_BOX 在 y315~410）判翻页 —— 图标在 y620，比它低 300px。面板若自上而下重绘，
+    会出现「战力已经是新角色的、图标还是上一个人的」那种帧，两个判据都拦不住。而图标正是拿来
+    **定身份**的，读错一帧就等于把上一个人的身份安到了这一行上 —— 那比不读还糟。
+    """
+    prev_tiles = read_icon_tiles(img)
+    first = match_icons(prev_tiles, tpl)
+    if not verify:
+        return first
+    for _ in range(max(1, tries)):
+        time.sleep(wait)
+        cur_tiles = read_icon_tiles(screen.grab())
+        again = match_icons(cur_tiles, tpl)
+        if all(first[d][0] == again[d][0] for d in ICON_DIMS):
+            return first
+        first, prev_tiles = again, cur_tiles
+    # 三次结论都不一样：画面一直在动。把两帧读到的东西和像素差都打出来 ——
+    # 分不清「真是转场」还是「某个图标本身有动画」，得靠这两个数判断。
+    show = lambda g: "、".join(f"{d}={g[d][0] or '?'}" for d in ICON_DIMS)
+    gap = "、".join(f"{d}{np.abs(prev_tiles[d] - cur_tiles[d]).mean():.1f}" for d in ICON_DIMS)
+    print(f"      ⚠️ 图标两次读数结论不同：前一帧 {show(first)}；像素差 {gap}")
+    return None
+
+
+def icons_agree(name, icons, attrs):
+    """图标读数与该姓名在图鉴里的四维是否一致。-> True / 对不上的维度名 / None（无从判断）。
+
+    「认不出」的维度不参与（返回 None 的那一维没有证据）；图鉴里查无此人（国服特供）也返回 None。
+    """
+    a = attrs.get(name)
+    if not a:
+        return None
+    for d in ICON_DIMS:
+        v = icons[d][0]
+        if v is not None and ICON_ALIAS.get(v, v) != a.get(d):
+            return d
+    return True
+
+
+def load_roster_attrs(path=ROSTER_PATH):
+    """图鉴 -> {姓名: {属性,企业,武器,职业}}。读不到返回 None（调用方据此关掉图标定名并告警）。"""
+    try:
+        raw = json.loads((Path(__file__).resolve().parent / path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return {k: v for k, v in raw.items() if isinstance(v, dict) and all(d in v for d in ICON_DIMS)}
+
+
+def resolve_icons(ocr_name, icons, roster, attrs):
+    """图标读数 + OCR 名 -> (要采用的名字 或 None, 说明)。None = 保持 OCR 原名不动。
+
+    判据分档，**只有前两档敢改名**：
+      ① 图标唯一命中（|C| == 1）且不是 OCR 名 —— 图标单独就把人认死了。
+      ② C 与姓名候选 N 的交集唯一、且不是 OCR 名 —— 图标和姓名两路互相印证。
+      ③ 其余一律**保持原名 + 告警**。特别地，「C ∩ N 恰好等于 OCR 名、但 |C| > 1」是**伪确认**：
+        图标其实一个候选都没排除掉（`红莲` 的四维同元组里还有 `红莲：暗影`），只是恰好包含
+        这个名字而已。把它记成「按图标定为红莲」会让人误以为拿到了双证据 —— 必须单独拎出来。
+    """
+    bad = [d for d, (v, _ok) in icons.items() if v is None]
+    if bad:
+        return None, "图标认不出（" + "、".join(bad) + "），退回 OCR 名"
+    want = {d: ICON_ALIAS.get(v, v) for d, (v, _ok) in icons.items()}
+    shown = "、".join(f"{d}={icons[d][0]}" for d in ICON_DIMS)
+    C = {n for n, a in attrs.items() if all(a.get(d) == want[d] for d in ICON_DIMS)}
+    if not C:
+        return None, (f"图标（{shown}）在图鉴里找不到四维全等的人 "
+                      f"—— 国服特供（如 婴宁/画皮）属正常，其余要人工看")
+    nm = norm_name(ocr_name)
+    # 改名时把「原来读成什么」一并报出来 —— 否则日志里只有「按图标定为 X」，看不出级联修了什么
+    was = f"屏幕读到「{ocr_name}」" if ocr_name else "屏幕没读到名字"
+    N = {norm_name(x) for x in name_candidates(nm, roster, limit=10)} if nm else set()
+    if len(C) == 1:
+        only = next(iter(C))
+        if norm_name(only) == nm:
+            return None, f"图标（{shown}）唯一命中「{only}」，与屏幕读到的名字一致"
+        if not N:
+            # 屏幕上读到的名字在图鉴里**连一个相近的都没有**。这只有两种可能：这人是国服特供
+            # （如 婴宁/画皮，全网无图鉴），或者这名字已经碎到不成形。**两种分不开** ——
+            # 但代价不对称：特供被「唯一命中」的那个人**一定是错的**，而且改名之后名字就合法了，
+            # correct_gui 反而不再告警（现状至少会标 ▲）；而读崩的名字留着，现状就会把它标出来。
+            # 所以这一档**不改名**，只把图标看到的喊出来。
+            return None, (f"图标唯一命中「{only}」（{shown}），但屏幕上读到的「{ocr_name}」"
+                          f"在图鉴里连相近的名字都没有 —— 可能是国服特供（如 婴宁/画皮），"
+                          f"也可能只是读崩了。**不改名**，请人工确认")
+        return only, f"按图标定为「{only}」（{was}）：四维（{shown}）在图鉴里唯一命中"
+    inter = {n for n in C if norm_name(n) in N}
+    if len(inter) == 1:
+        only = next(iter(inter))
+        if norm_name(only) != nm:
+            return only, (f"按图标 + 姓名候选定为「{only}」（{was}）：图标留下 {len(C)} 个候选 "
+                          f"（{'、'.join(sorted(C))}），姓名候选再筛到它一个")
+        return None, (f"图标与姓名一致，但**图标没能排除别人**：四维同组的还有 "
+                      f"{'、'.join(sorted(x for x in C if x != only))} —— 需人工确认")
+    return None, (f"图标留下 {len(C)} 个候选（{'、'.join(sorted(C))}），"
+                  f"与姓名候选交不出唯一结果，退回 OCR 名")
+
+
+# ----------------------------------------------------------------------------
 # 采集主流程
 # ----------------------------------------------------------------------------
 def build_row(name, cp, slots):
@@ -885,6 +1148,21 @@ def collect_offline(engine, ps_path="ps.png", eq_path="equipment.png"):
     name, level, cp = read_info_page(engine, img_ps)
     print(f"信息页：名字={name} 等级={level} 战力={cp}")
 
+    # 图标级联自检：只读不改、几毫秒，比真机跑一趟快得多。用来确认模板与抠图框在
+    # 这台机器/这个分辨率上是通的 —— 认不出会明说，而不是让姓名静默退回 OCR。
+    try:
+        icons = match_icons(read_icon_tiles(img_ps), load_icon_templates())
+        print("  图标：" + "、".join(f"{d}={icons[d][0] or '认不出'}" for d in ICON_DIMS))
+        attrs = load_roster_attrs()
+        roster_full, rerr = load_roster(str(Path(__file__).resolve().parent / ROSTER_PATH))
+        if attrs and roster_full:
+            got, why = resolve_icons(name, icons, roster_full, attrs)
+            print(f"  图标定名：{why}" + (f" → 「{got}」" if got else "（保持原名）"))
+        else:
+            print(f"  图标定名：跳过（图鉴读不到：{rerr}）")
+    except SystemExit as e:
+        print(f"  图标自检跳过：{e}")
+
     stat_table = load_stat_table()
     slots = {}
     for slot, _ in SLOTS.items():
@@ -926,6 +1204,14 @@ def _archive_previous(path):
     return dst
 
 
+def _json_rows(path):
+    """这个结果文件里有多少行；读不到/空壳返回 0。"""
+    try:
+        return len(json.loads(Path(path).read_text(encoding="utf-8")).get("角色", []))
+    except Exception:
+        return 0
+
+
 def _save_rows(rows, out=ONLINE_OUT):
     """把已采的角色增量写盘：原子替换（先写临时文件再 rename），中途中断不丢、不坏。
 
@@ -938,22 +1224,73 @@ def _save_rows(rows, out=ONLINE_OUT):
     tmp.replace(out)
 
 
-def collect_online(engine, screen, max_chars=500, save_shots=False):
-    """在线循环采集：停在信息页，翻页直到 LV.1。save_shots=True 时每页截图存 output/shots/。"""
+def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False, asserts=None,
+                   with_icons=True):
+    """在线循环采集：停在信息页，翻页直到 LV.1。save_shots=True 时每页截图存 output/shots/。
+
+    patch=True 走**增量（补丁）模式**，与全量只差两处，但两处都要命：
+      * 结果写 PATCH_OUT，**主数据一个字节都不动** —— 补丁要经 correct_gui 人工仲裁后才并进去。
+        错名/误判因此永远污染不了主数据。
+      * **不归档主数据**。_archive_previous 在全量路径上是无条件执行的，增量跑也照做的话，
+        每次增量都会把主 JSON 改名留底、腾出位置 —— 那是全量的语义，不是增量的。
+    asserts 是 --as 给的身份断言，**按扫描顺序一一对应**（见 name_matches）。
+    with_icons=True 时用信息页那四个图标独立定名（见 resolve_icons），--no-icons 可关掉。
+    """
     rows = []
+    out = PATCH_OUT if patch else ONLINE_OUT
+    asserts = [a for a in (asserts or []) if a]
+    roster = load_roster_names() if asserts else None
     stat_table = load_stat_table()
+
+    # 图标定名的三个前置件。模板读不到直接 SystemExit（见 load_icon_templates）；
+    # 图鉴读不到则**关掉整条图标定名并响亮告警** —— 那种情况下每一行都会退回 OCR 原名，
+    # 约四成是错的，绝不能让它在没人知道的情况下发生。
+    icon_tpl = roster_full = attrs = None
+    if with_icons:
+        icon_tpl = load_icon_templates()
+        roster_full, rerr = load_roster(str(Path(__file__).resolve().parent / ROSTER_PATH))
+        attrs = load_roster_attrs()
+        if not roster_full or not attrs:
+            icon_tpl = None
+            print(f"⚠️⚠️ 图鉴读不到（{rerr}），**图标定名整条关闭** —— "
+                  f"本次每一行都会退回 OCR 原名，实测约四成会读错。")
+        else:
+            print(f"图标定名已就绪：{sum(len(v) for v in ICON_VALUES.values())} 个模板，图鉴 {len(attrs)} 人。")
     shots_dir = Path("output/shots")
     if save_shots:
         shots_dir.mkdir(parents=True, exist_ok=True)
-    print("=== 在线模式 ===")
-    prev = _archive_previous(ONLINE_OUT)
-    if prev:
-        print(f"（上一轮结果已留底：{prev}）")
+    print("=== 在线模式（增量） ===" if patch else "=== 在线模式（全量） ===")
+    if patch:
+        print(f"结果写 {out}；主数据 {ONLINE_OUT} 不动，留给 correct_gui 合并（也不会被归档）。")
+    else:
+        n_before = _json_rows(ONLINE_OUT)
+        prev = _archive_previous(ONLINE_OUT)
+        if prev:
+            print(f"（上一轮结果已留底：{prev}）")
+        if n_before and max_chars < n_before:
+            # 这个坑踩过两次了：`--max 3` 看着人畜无害，其实全量路径是「归档 + 整个替换」，
+            # 一跑就把 52 行的主数据换成 3 行。留底能救回来，但前提是你**先发现**。
+            print(f"⚠️ 主数据原有 {n_before} 行，本次 --max {max_chars} 只会采 {max_chars} 行的量，"
+                  f"结果会**替换**掉那 {n_before} 行（旧文件已留底，可还原）。\n"
+                  f"   只是想更新个别角色的话，请改用 --patch —— 它一个字节都不动主数据，"
+                  f"跑完在 correct_gui 里合并。")
+    if asserts:
+        # 手打错字在这里就要报出来：等扫完再发现，白等几分钟
+        if roster is not None:
+            unknown = [a for a in asserts if norm_name(a) not in roster]
+            if unknown:
+                print(f"⚠️ 断言里有图鉴查无的名字：{'、'.join(unknown)}"
+                      f"（国服特供如「婴宁」「画皮」属正常；否则大概是打错了）")
+        print(f"身份断言 {len(asserts)} 个：{'、'.join(asserts)}"
+              + ("" if len(asserts) >= max_chars
+                 else f"（不足 --max {max_chars}，第 {len(asserts) + 1} 行起没有断言）"))
     print("5 秒后开始采集，请立即 Alt+Tab 切回游戏（角色信息页），期间别碰鼠标键盘 ...")
     for i in range(5, 0, -1):
         print(f"  {i} ...")
         time.sleep(1)
     prev_name, prev_cp = None, None
+    # 第一行也按「刚翻页」处理：那是操作员手动把画面摆到这一格的，同样没被任何内容判据校验过
+    turned = True
     for i in range(max_chars):
         # 角色起点：翻页刚结束可能在转场，多给几次机会（'other' 只等不点）
         if not _ensure_info(screen, SLOTS["头"], tries=4, timeout=5.0):
@@ -964,7 +1301,52 @@ def collect_online(engine, screen, max_chars=500, save_shots=False):
         if save_shots:
             img.save(shots_dir / f"{i + 1:03d}_info.png")
         name, level, cp = read_info_page(engine, img)
+
+        # ---- 图标：四个静态图标 -> 四维读数（不 OCR，~1ms）----
+        icons, icon_str, verdict_note = None, "", ""
+        if icon_tpl is not None:
+            icons = read_icons_stable(screen, img, icon_tpl, verify=turned)
+            turned = False
+            if icons is None:
+                icon_str = "图标读数不稳定，这一行不做图标判定（退回 OCR 名）"
+            else:
+                icon_str = "图标 " + "、".join(f"{d}={icons[d][0] or '?'}" for d in ICON_DIMS)
+
+        want = asserts[i] if i < len(asserts) else None
+        if want:
+            if name_matches(name, want):
+                # 相符（含横幅截断）-> 采用断言的姓名。这正是 --as 的主要价值：
+                # 把「红莲」这种截断名修回「红莲：暗影」——姓名是主键，截断名会撞上真实角色。
+                if name != want:
+                    print(f"    （姓名按断言修正：{name!r} → 「{want}」）")
+                name = want
+            else:
+                # 不符 -> **保留屏幕读到的名字**，不让断言盖掉它。
+                # 盖掉就等于「停错格子也照写断言名」，会拿着别人的装备静默覆盖「{want}」那一行；
+                # 留着 OCR 名，correct_gui 会把它标成「图鉴查无此人」逼人看一眼。
+                print(f"    ❌ 身份不符：屏幕读到「{name}」，你断言的是「{want}」——"
+                      f"很可能停错格子/翻页没完成。这一行保留屏幕读到的名字，请务必核对！")
+            # 图标与断言冲突：断言是**按下标一一对应**的，错一格后面每一行都会错位，
+            # 而且错位后的名字仍然可能「看着对」（子序列规则很松）。图标的读数与下标无关，
+            # 是这里唯一能当场戳穿错位的硬证据 —— 所以不停下来只会把后面全部污染。
+            if icons:
+                bad = icons_agree(name, icons, attrs)
+                if bad not in (None, True):
+                    print(f"    ❌❌ 图标与断言不符：**{bad}** 这一维图标读的是「{icons[bad][0]}」，"
+                          f"而「{name}」在图鉴里是「{attrs[name][bad]}」。"
+                          f"断言错一格后面全会错位 —— 立即中止，请重跑。")
+                    break
+        elif icons and attrs:
+            fixed, why = resolve_icons(name, icons, roster_full, attrs)
+            verdict_note = why
+            if fixed and fixed != name:
+                name = fixed
+
         print(f"[{i + 1}] {name} LV.{level} 战力 {cp}")
+        if icon_str:
+            print(f"    {icon_str}")
+        if verdict_note:
+            print(f"    → {verdict_note}")
 
         if level is None:
             print("⚠️ 读不到等级，画面可能不在信息页，中断。")
@@ -1017,10 +1399,16 @@ def collect_online(engine, screen, max_chars=500, save_shots=False):
             time.sleep(0.2)  # 返回后缓冲，避免紧接着点下一槽太快
 
         rows.append(build_row(name, cp, slots))
-        _save_rows(rows)  # 每采完 1 角色就落盘，中断不丢
+        _save_rows(rows, out)  # 每采完 1 角色就落盘，中断不丢
 
         if level == 1:
             print(f"到达 LV.1（{name}），采集完成，停止。")
+            break
+
+        if i + 1 >= max_chars:
+            # 别在最后一格再翻一次页：翻了还要白等最多 15 秒，而且游戏会停在**下一个**角色上 ——
+            # 增量扫描正靠「停在原地、下次接着往后扫」，起点一漂就串行。
+            print(f"已达 --max {max_chars}，不再翻页（游戏停在「{name}」这一格）。")
             break
 
         # 翻页到下一个角色：等战力变化（名字有平行滚动，截两次可能不同，不可靠）
@@ -1031,9 +1419,12 @@ def collect_online(engine, screen, max_chars=500, save_shots=False):
                 screen.grab().save(shots_dir / f"{i + 1:03d}_TURN_FAIL.png")
             print("⚠️ 翻页后未见战力变化，中断（可能已到末位或点击失效）。已存 NNN_TURN_FAIL.png。")
             break
+        turned = True   # 翻页后图标读数要双帧确认，见 read_icons_stable
 
-    _save_rows(rows)
-    print(f"\n采集 {len(rows)} 个角色，已写入 {ONLINE_OUT}")
+    _save_rows(rows, out)
+    print(f"\n采集 {len(rows)} 个角色，已写入 {out}")
+    if patch:
+        print("这是**补丁**，主数据没动。开 correct_gui.py 走「合并补丁」人工确认后才会并进去。")
     return {"角色": rows}
 
 
@@ -1046,6 +1437,14 @@ def main():
                     help="离线模式用的装备浮层页截图（默认 equipment.png）")
     ap.add_argument("--max", type=int, default=500, help="在线模式最大采集角色数（兜底）")
     ap.add_argument("--save-shots", action="store_true", help="在线采集时每页截图存 output/shots/（调试用）")
+    ap.add_argument("--patch", action="store_true",
+                    help=f"增量模式：结果写 {PATCH_OUT}，主数据 {ONLINE_OUT} 不动也不归档")
+    ap.add_argument("--as", dest="asserts", default="", metavar="名字[,名字…]",
+                    help="按扫描顺序断言身份，如 --as '红莲：暗影,桃乐丝'。人就在游戏里看着屏幕，"
+                         "比 OCR 可靠；只在增量模式下有意义，给了它会自动等于 --patch")
+    ap.add_argument("--no-icons", action="store_true",
+                    help="关掉「用信息页那四个图标独立定名」。逃生开关，正常情况下不用它 —— "
+                         "关掉之后姓名就只剩 OCR 一条路，实测约四成会读错")
     ap.add_argument("--check-state", action="store_true",
                     help="只校验页面状态分类器（不采集、不加载 OCR）：根目录样本 + output/shots/*.png")
     args = ap.parse_args()
@@ -1069,8 +1468,15 @@ def main():
     if args.offline:
         collect_offline(engine, args.ps, args.eq)
     else:
+        # 全角/半角逗号都认：手打的时候没人会去想用的是哪一种
+        asserts = [s.strip() for s in re.split(r"[,，]", args.asserts) if s.strip()]
+        patch = args.patch
+        if asserts and not patch:
+            patch = True
+            print("（--as 只在增量模式下有意义，已自动切到 --patch）")
         screen = Screen(offline=False)
-        collect_online(engine, screen, max_chars=args.max, save_shots=args.save_shots)
+        collect_online(engine, screen, max_chars=args.max, save_shots=args.save_shots,
+                       patch=patch, asserts=asserts, with_icons=not args.no_icons)
 
     del engine
 
