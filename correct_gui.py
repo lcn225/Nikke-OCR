@@ -1324,7 +1324,7 @@ class CellEditor:
             ed.set(display)
             self._autofilter(ed, vals)
             w = 160
-        elif spec.kind == "pct":
+        elif spec.kind == "pct" and self.app.model.affix_table:
             vals, note = self._value_choices(view_r, spec, display)
             ed = ttk.Combobox(grid.cv, state="readonly", values=vals)
             ed.set(display)
@@ -1337,6 +1337,13 @@ class CellEditor:
             ed.bind("<Down>", lambda e, c=ed, v=vals: self._cycle(c, v, 1))
             w = 104
         else:
+            if spec.kind == "pct":
+                # 词条表整个没载入（最常见的原因：没装 openpyxl）-> 没有档位可查。
+                # **必须和「这一格真的没有档位」区分开**：两者都表现为「下拉点开是空的」，
+                # 长得一模一样，上一次排查正是从那里倒着查了一圈。所以这里退回普通输入框，
+                # 并把原因说出来（同 text 列在 roster 缺失时退回 Entry 的做法）。
+                self.app.flash("词条表未载入（缺 openpyxl），数值列已退化成手输："
+                               "pip install -r requirements.txt", "err")
             ed = ttk.Entry(grid.cv)
             ed.insert(0, display)
             ed.selection_range(0, "end")
@@ -1348,14 +1355,17 @@ class CellEditor:
         ed.bind("<Tab>", lambda e: self._commit_and_move(1, 0))
         ed.bind("<Shift-Tab>", lambda e: self._commit_and_move(-1, 0))
         ed.bind("<ISO_Left_Tab>", lambda e: self._commit_and_move(-1, 0))
-        if spec.kind not in ("level", "affixname", "text", "pct"):
-            ed.bind("<FocusOut>", lambda e: self.finish(commit=True))
-        else:
+        # 按**控件类型**判，不按 spec.kind 判：pct 列在词条表没载入时会退化成 Entry，
+        # 而「新增一种 kind 就得记得补进这个元组」本身就是个坑（09-27 加 pct 时踩过，
+        # 忘了补就会出现「点下拉没反应」）。看 isinstance 就没有第二处要同步。
+        if isinstance(ed, ttk.Combobox):
             # ⚠️ 下拉框的弹出列表也会触发 FocusOut。直接提交会把刚弹出来的候选列表
             #    销毁掉 —— 表现就是「点下拉没反应、要点好几遍」（实测踩过）。
             #    所以延后一拍、确认焦点真的离开了自己和 popdown 再提交。
             ed.bind("<FocusOut>", lambda e, widget=ed: self.app.root.after(
                 90, lambda: self._focus_left(widget)))
+        else:
+            ed.bind("<FocusOut>", lambda e: self.finish(commit=True))
         self.w, self.view_r, self.spec, self.orig = ed, view_r, spec, display
 
     def _value_choices(self, view_r, spec, display):
@@ -1366,6 +1376,10 @@ class CellEditor:
         也就省掉了「选项 -> 小数」这层映射。写回仍走 `parse_pct_input`。
 
         返回 (候选, 需要提醒用户的一句话或 None)。
+
+        ⚠️ **不能拿「候选为空」当「没档位可查」**：现值总会被追加进候选（不然 `set()`
+        会落空），所以查不到档位时列表至少也有一项。真正的判据是 `model.affix_table`
+        有没有载入 —— 由 `open()` 判断，没载入就退化成手输，不给一个点开是空白的下拉。
         """
         rid = self.app.grid.row_ids[view_r]
         row = self.app.model.rows[rid]
@@ -1376,6 +1390,13 @@ class CellEditor:
         note = None
         if name == EMPTY_AFFIX:
             levels = [0.0]              # 未获得效果：游戏里这格恒为 0
+        elif not table:
+            # 词条表整个没载入 —— 和下面「词条名未定」是**两回事**，别混成一句话：
+            # 这一种是环境问题（缺 openpyxl），不是这格的数据有问题。这里只负责把话说清；
+            # 「退化成手输」由 open() 查 affix_table 决定（候选不会是空列表，见上）。
+            levels = []
+            note = (f"{spec.col_id} 词条表未载入（缺 openpyxl），没有档位可查："
+                    "pip install -r requirements.txt")
         else:
             levels = [float(v) for v in (table.get(name) or [])] if name else []
             if not levels:
@@ -1908,7 +1929,7 @@ class App:
         root.minsize(900, 500)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build()
-        self.hint.configure(text=self.hint_text())
+        self.refresh_hint()
         self.rerender()
         self.refresh_status()
 
@@ -2086,7 +2107,7 @@ class App:
         self.dirty = False
         self.archived = False
         self.rerender()
-        self.hint.configure(text=self.hint_text())
+        self.refresh_hint()
         self._update_merge_btn()
         self.refresh_status()
 
@@ -2206,12 +2227,21 @@ class App:
                    f"跳过 {len(patch_rows) - added - over}", "info")
         return True
 
+    def refresh_hint(self):
+        """顶部那句提示：**有话说时变红**。
+
+        灰字的提示实测会被当成装饰看漏 —— 缺 openpyxl 时它是「数值列下拉是空的」
+        唯一线索，看过了也没意识到是故障。所以非空就上警色。
+        """
+        txt = self.hint_text()
+        self.hint.configure(text=txt, foreground=FG_MARK if txt else "#666666")
+
     def hint_text(self):
         bits = []
         if self.model.roster is None:
             bits.append("图鉴未载入，姓名校验已关闭")
         if self.model.affix_table is None:
-            bits.append("词条表未载入，档位校验已关闭")
+            bits.append("词条表未载入（缺 openpyxl？），数值列已退化成手输")
         return " / ".join(bits)
 
     def on_close(self):

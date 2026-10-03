@@ -80,6 +80,12 @@ pip install -r requirements.txt
 `equipment.xlsx`（词条档位表 + 装备加成表）与 `docs/chacters.json`（角色图鉴，201 条，含
 姓名 → 属性/企业/武器/职业）已随仓库提供，不用另外准备。
 
+> **依赖没装齐会「静默降级」，看起来像功能坏了** —— 记一下症状，免得倒着查一圈：
+> 缺 `openpyxl` 时 `equipment.xlsx` 读不进来，**数值列的档位下拉点开是空的**（姓名列
+> 照常，因为它的候选来自 `docs/chacters.json`，不碰 openpyxl），采集则是 `import`
+> 就直接失败。界面顶部会把这类降级**标红**写明（「词条表未载入（缺 openpyxl？），
+> 数值列已退化成手输」），看到就重跑上面那条命令。
+
 ---
 
 ## 使用
