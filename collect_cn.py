@@ -13,22 +13,32 @@
   在线(Windows 本机，pyautogui 截屏+点击)： python collect_cn.py
   离线(用截图文件模拟，验证逻辑)：   python collect_cn.py --offline
 
-输出：output/cn_collect.json —— 每角色一行：姓名、战力、头/身/手/足 各{等级, 词条[3]}。
-      开跑前会把上一轮的这个文件改名加时间戳留底（cn_collect.<YYYYMMDD-HHMMSS>.json），
-      避免新一轮直接覆盖掉上一轮的结果。
+**采集只产出补丁。** 输出 output/cn_patch.json —— 每角色一行：姓名、战力、头/身/手/足
+各{等级, 词条[3]}，外加顶层 `_图标` 兄弟键（每行的图标四维读数）。**主数据
+output/cn_collect.json 一个字节都不动**，错名/误判因此永远污染不了它；主数据只有
+correct_gui 的「合并」才写。日常不必从命令行走：界面里点「采集…」，跑完自动接上合并。
+采集侧没有跳转能力（只有点「>>」逐格前进一条路），所以"翻到哪儿"由你在游戏里决定 ——
+扫几个角色只是范围不同（「增量」填个数 / 「全量」扫到最后一个），后面的
+「对比旧表 → 有更新就更新 / 没更新照旧 / 新角色追加」是同一件事。
+
+  python collect_cn.py --max 3        从当前画面起，重扫 3 个（增量）
+  python collect_cn.py --max 500      从当前画面起，扫到最后一个角色（全量；先翻到名单最上面）
+
+**逃生口 `--replace`**：只有换号 / 砍掉重练这类"主数据整个不要了"的场合才用。它会
+先把 output/cn_collect.json 改名加时间戳留底（cn_collect.<YYYYMMDD-HHMMSS>.json），再用
+本次结果**整个替换**它 —— 正是上面那条不变量要躲开的破坏性路径，所以必须手打，界面不可达。
+
+  python collect_cn.py --replace --max 500
 
 姓名怎么定的：读到的名字是**滚动横幅**的截帧，实测约四成会截断读错，而且最险的一种错是
 「截断后恰好等于另一个真实角色」——那种错在 correct_gui 里是**零告警**的。所以每行还会读
 信息页下方**四个静态图标**（属性/武器/职业/企业，逐像素稳定），拿四维去图鉴里筛人：
 图标唯一命中、或与姓名候选交成唯一，才敢用图标定下来的名字；其余一律保持 OCR 原名并告警。
 
-增量（升级了少数角色的装备后，不必全量重扫）：
-    python collect_cn.py --max 3 --as "红莲：暗影,桃乐丝,阿妮斯"
-  先在游戏里手动翻到第一个要重扫的角色，再跑；结果写 output/cn_patch.json，
-  **主数据一个字节都不动**，之后开 correct_gui.py 走「合并补丁」逐条确认才并进去。
-  采集侧没有跳转能力（只有点「>>」逐格前进一条路），所以"翻到哪儿"由你在游戏里决定。
-  --as 按扫描顺序断言身份：屏幕没读到名字、或只读到截图横幅的截断名时，用它修正；
-  明显不符（停错格子/翻页没完成）则**保留屏幕读到的名字**并响亮告警，不拿断言名去盖。
+`--as` 是废弃路径的遗留：它让人手打名字断言身份，打错还会中止整轮扫描，而图标本来就是
+与姓名无关的机器证据（实测 31/31 全对）。仍保留为命令行逃生口（3 组四维相同的变体对、
+以及图鉴外的国服特供才需要它），但已不在正常流程里。
+
 词条规范名取 9 个游戏内名称（都带「增加」）；数值为百分比小数(11.81% → 0.1181)。
 T9/T10 判定：装备页读到词条即 T10，无词条即 T9（词条留空）。
 """
@@ -255,12 +265,11 @@ def _texts_in(engine, img, region):
 # 字段区域（bbox 中心落点范围）
 NAME_REGION = (1740, 225, 1880, 280)      # 角色名（右侧面板）
 LEVEL_REGION = (1580, 240, 1735, 280)     # 等级 "LV.xxx /200"
-CP_REGION = (1700, 330, 1860, 395)        # 战力数字（区域过滤用；read_info_page 走大框+过滤，见下）
-# 翻页判定专用战力裁条。⚠️ 不要拿紧贴的 CP_REGION 去裁图：它上切「战斗力」(y323-340)、
-# 下切「BATTLE」(y385-400) 各一半，OCR 碰到半截残片会整块输出空 —— 003/004 实测小框裁出
-# []，而同一张图走大框 + 区域过滤能读到 179418/177944，翻页判定因此 15s 超时。
-# 留足余量把三行完整包住；parse_int 取最大数，多包进来的字无害。
-CP_BOX = (1690, 315, 1875, 410)
+CP_REGION = (1700, 330, 1860, 395)        # 战力数字（区域过滤用；战力只走 read_cp 一条路，见下）
+# ⚠️ 曾经为了「翻页判定」另开过一个小裁剪框 CP_BOX(1690,315,1875,410)，**已经删掉**：
+# 同一张信息页，大框+区域过滤读 146731，那个小框读 14673（丢末位）——21 张实测差 1 张。
+# 裁剪框一动，OCR 的行切分就变，同一个字段能读出两个数；两处读数不同源就会假阳性，
+# 详见 read_cp 的 docstring。
 
 # 联合裁剪框（外扩 15px 防切字；整屏 2x → 区域裁剪用）
 INFO_PANEL_BOX = (1565, 210, 1895, 410)   # 信息页右侧面板：名字+等级+战力
@@ -372,13 +381,36 @@ def parse_pct(texts):
 # ----------------------------------------------------------------------------
 # 页面读取
 # ----------------------------------------------------------------------------
+def _cp_from_items(items):
+    """面板 OCR 结果 -> 战力（只取 bbox 中心落在 CP_REGION 里的那几条）。
+
+    read_info_page 与 read_cp 共用，保证「存进数据的战力」和「判翻页/复核用的战力」
+    永远是同一个数 —— 分两条路读会出现两个值，见 read_cp。
+    """
+    return parse_int([t for t, x0, y0, x1, y1 in items if _in_region((t, x0, y0, x1, y1), CP_REGION)])
+
+
+def read_cp(engine, img):
+    """信息页战力。**全流程只走这一条路**（read_info_page / wait_page_turn / _confirm_same_char）。
+
+    ⚠️ 别为了省一点裁剪面积另开小框：**裁剪框一变，OCR 的行切分就变，同一张图能读出不同的数**
+    —— 实测 21 张真机信息页里，`021`（桃乐丝 146731）走大框读对，走旧的小框 CP_BOX 读成
+    14673（丢末位）。两处读数一旦不同源，「翻页完成」和「换人复核」就都会假阳性：
+
+      * `wait_page_turn` 拿小框读数去和 read_info_page 的 prev_cp 比，**点完「>>」的第一帧
+        就成立**（页面根本没动），于是这一行的身份读的是旧角色、装备点的是新角色 ——
+        莱伊·甲 那个错位就是这么来的（那次两行战力一字不差，正是"没翻页却宣布翻页成功"）。
+      * `_confirm_same_char` 同理，会把好行判成"屏幕换人了"而中止整轮（桃乐丝那一行实测复现）。
+    """
+    return _cp_from_items(_ocr_crop(engine, img, INFO_PANEL_BOX))
+
+
 def read_info_page(engine, img):
     """角色信息页 -> (名字, 等级, 战力)。右侧面板联合框单次裁剪 2x，按区域过滤。"""
     items = _ocr_crop(engine, img, INFO_PANEL_BOX)
     name = parse_name([t for t, x0, y0, x1, y1 in items if _in_region((t, x0, y0, x1, y1), NAME_REGION)])
     level = parse_level([(t, x0, y0, x1, y1) for t, x0, y0, x1, y1 in items if _in_region((t, x0, y0, x1, y1), LEVEL_REGION)])
-    cp = parse_int([t for t, x0, y0, x1, y1 in items if _in_region((t, x0, y0, x1, y1), CP_REGION)])
-    return name, level, cp
+    return name, level, _cp_from_items(items)
 
 
 def _read_affix_names(engine, img, dy=0):
@@ -515,9 +547,15 @@ def _read_affix_values(engine, img, name_rows, table, dy=0):
 TYPE_BOX = (735, 45, 825, 92)
 STAT_BOX = (860, 520, 1045, 600)       # 装备能力值面板（左标签列 右数值列）
 EQUIP_XLSX = "equipment.xlsx"
-ONLINE_OUT = "output/cn_collect.json"         # 在线采集结果（全量）
+ONLINE_OUT = "output/cn_collect.json"         # 主数据（角色表）；**只由 correct_gui 的合并写入**
 OFFLINE_OUT = "output/cn_collect_offline.json"  # 离线自检结果（独立文件，不覆盖真实结果）
-PATCH_OUT = "output/cn_patch.json"              # 增量补丁（--patch）；**绝不直接改主数据**
+PATCH_OUT = "output/cn_patch.json"              # 采集产出（补丁）；**绝不直接改主数据**
+# 补丁文件的**顶层兄弟键**：与「角色」同下标，每条是 {维度: 值 或 None}（整条也可为 None）。
+# 存在的理由：图标是唯一的机器身份证据，但原先只打印到控制台、扫完就没了，于是合并侧手里
+# 只剩一个可能截断的姓名，只能拿名字猜。带过去之后合并侧才能按四维定人。
+# **刻意放顶层而不是塞进行里**：行的键集是对下游的契约（数据说明.md），且 correct_gui
+# 的 normalize_row 会丢掉行里不认识的键 —— 塞进去既带不过去又会漏进主数据。
+ICONS_KEY = "_图标"
 ROSTER_PATH = "docs/chacters.json"              # 图鉴（姓名 -> 属性/企业/武器/职业），只拿姓名当名单
 
 _TYPES = ["火力型", "辅助型", "防御型"]
@@ -791,33 +829,78 @@ def _ensure_info(screen, xy, tries=3, timeout=5.0):
 
 
 def wait_page_turn(screen, engine, prev_cp, prev_name, timeout=15.0, interval=0.3):
-    """翻页完成判定：回到信息页，且（战力变化）或（名字稳定且 != 上一角色）。
+    """翻页完成判定：回到信息页，且**战力连续两次读到同一个新值**（或名字连续稳定且 != 上一角色）。
 
     主判据是战力：长名有平行滚动，同一角色截两次可能读到不同片段，
     旧的 _name_changed 因此会假阳性（误判成已翻页）。
     名字只作兜底，且要求连续两次读到同一个名字才算稳定（滚动中读不到重复值）。
+
+    ⚠️ 战力**必须连着两帧读到同一个值**才算数，只信一帧会在动画没走完时就放行：
+    翻页只是面板在滑动，面板外的亮度不变，所以 page_state 全程都判 'info'（这道判据在这里
+    完全失效），而战力裁剪框在滑动中会读到**混叠数字** —— 那一帧读到的"新战力"既不是旧的
+    也不是新的。放行早了，这一行的姓名/战力/图标读的是**旧页**、四次装备点击却落在**新页**上，
+    于是把下一个角色的装备记到这一行头上（莱伊·甲 = 桑迪·头 就是这么来的）。
+    实测：停米卡跑 3 行增量，第 2 行读到的还是米卡（战力与第 1 行一字不差）。
     """
     t0 = time.time()
-    last_name = None
+    last_name, last_cp = None, None
     trace = []  # 超时时回放最后几次轮询，看清是「页面没翻」还是「翻了但没读到」
     while time.time() - t0 < timeout:
         img = screen.grab()
         st = page_state(img)
         cp = None
         if st == "info":
-            cp = parse_int(_crop_ocr(engine, img, CP_BOX))
-            if cp is not None and cp != prev_cp:
+            # 战力必须走 read_cp（= read_info_page 同一条路）：换个小框读会得到另一个数，
+            # 那样 prev_cp 永远比不上，第一帧就假阳性，见 read_cp。
+            cp = read_cp(engine, img)
+            # 同一个 ≠prev_cp 的值连着两帧 → 认定翻页完成（滑页里的混叠读数撑不过第二帧）
+            if cp is not None and cp != prev_cp and cp == last_cp:
                 return True
             nm = parse_name(_crop_ocr(engine, img, NAME_REGION))
-            if nm is not None and nm != prev_name and nm == last_name:
+            # 名字兜底：**prev_name 读不到时这一路直接作废**。否则「页面上还是旧角色」的那两帧
+            # 天然同名同值，动画还没开始动就秒返回 —— 旧实现正是这么在 prev_name=None 上栽的。
+            if (prev_name is not None and nm is not None
+                    and nm != prev_name and nm == last_name):
                 return True
-            last_name = nm
+            last_name, last_cp = nm, cp
+        else:
+            last_name, last_cp = None, None   # 状态不明/转场：清掉，连续帧重新攒
         trace.append((round(time.time() - t0, 1), st, cp))
         time.sleep(interval)
     print(f"    [翻页诊断] 上一角色 战力={prev_cp} 名字={prev_name}；最后 {min(6, len(trace))} 次轮询：")
     for ts, st, cp in trace[-6:]:
         print(f"      t={ts:>5}s  页面状态={st:<8} 读到的战力={cp}")
     return False
+
+
+def _confirm_same_char(screen, engine, cp, tries=4, interval=0.3):
+    """点第一个装备槽之前问一句：屏幕上**还是战力 cp 的那个角色**吗。-> (是否还是, 最后读到的战力)
+
+    这是「身份与装备不许错位」的最后一道闸。`wait_page_turn` 判「翻页完成」若放行早了，
+    这一行的名字/战力来自旧页、而下面点开的是新页的装备槽 —— 实测 莱伊·甲 就是这么变成
+    桑迪·头的。判负 → 整行作废 + 立即中止（不写进补丁）。
+
+    读的是**战力值**、不是像素：信息页上有会动的东西（滚动横幅/立绘/高亮），像素级比对
+    实测每一行都对不上（见 read_icons_stable 那段教训）。该问的是「再独立读一次，还是同一个人吗」。
+
+    只做**一次**（第一槽之前），不是每槽都做：翻页动画的尾巴只可能落在开头这一下，而复核
+    一次要花一次面板 OCR —— 实测机器上一次 OCR 要 1~2 秒，每槽都做等于给每个角色 +4 次
+    （50s/角色的扫描再多 8s），不值。
+
+    判定写成「**读到过 cp 就放行，读满 tries 次都没读到 cp 才判负**」：
+      * 屏幕上就是这个角色时，哪怕 OCR 偶发读空，后面的重试总能读回 cp，不会冤枉；
+      * 真换人了的话，滑动中读空也好、读出混叠值也好，等动画停下来只会读到**新角色**的
+        战力，永远等不回 cp —— 所以重试不是"宽容"，而是把动画尾巴等完。
+    """
+    last = None
+    for _ in range(tries):
+        now = read_cp(engine, screen.grab())
+        if now == cp:
+            return True, cp
+        if now is not None:
+            last = now
+        time.sleep(interval)
+    return False, last
 
 
 def _empty_slot():
@@ -969,7 +1052,7 @@ def read_icons_stable(screen, img, tpl, verify=False, tries=3, wait=0.15):
     已经定下来了，那点像素噪声根本不影响匹配（同值类内距离 ~1.5，不同值之间 14~19）。
 
     为什么还要这一道：`page_state` 判「信息页」只看外圈亮度、**不看内容**，而 `wait_page_turn`
-    用战力（CP_BOX 在 y315~410）判翻页 —— 图标在 y620，比它低 300px。面板若自上而下重绘，
+    用战力（CP_REGION 在 y330~395）判翻页 —— 图标在 y620，比它低 300px。面板若自上而下重绘，
     会出现「战力已经是新角色的、图标还是上一个人的」那种帧，两个判据都拦不住。而图标正是拿来
     **定身份**的，读错一帧就等于把上一个人的身份安到了这一行上 —— 那比不读还糟。
     """
@@ -1065,6 +1148,18 @@ def resolve_icons(ocr_name, icons, roster, attrs):
                       f"{'、'.join(sorted(x for x in C if x != only))} —— 需人工确认")
     return None, (f"图标留下 {len(C)} 个候选（{'、'.join(sorted(C))}），"
                   f"与姓名候选交不出唯一结果，退回 OCR 名")
+
+
+def _icon_record(icons):
+    """{维度: (值 或 None, 是否可信)} -> {维度: 值 或 None}，供补丁文件携带（见 ICONS_KEY）。
+
+    **无损**：match_icons 只在不可信时才给 None（可信时给的一定是个值），所以「值」这一个
+    字段就同时表达了「读到了什么」和「可不可信」—— 某一维是 None 就等于那一维没读准。
+    icons 本身为 None（read_icons_stable 两帧结论不一致）时整条记 None，与「读到了但都不可信」区分开。
+    """
+    if icons is None:
+        return None
+    return {d: icons[d][0] for d in ICON_DIMS}
 
 
 # ----------------------------------------------------------------------------
@@ -1184,11 +1279,13 @@ def collect_offline(engine, ps_path="ps.png", eq_path="equipment.png"):
 
 
 def _archive_previous(path):
-    """开新采集前，把上一次的结果改名带时间戳留底。
+    """--replace 要整表覆盖主数据前，把旧文件改名带时间戳留底。
 
     否则新一轮会直接覆盖 output/cn_collect.json —— 这个坑真实发生过：37 人的结果
     被一次 6 人试跑覆盖掉，而落盘用的是 os.replace（原地替换、不进回收站），找不回来。
     空壳/损坏的文件不值得留底，返回 None 让新结果直接覆盖它。
+
+    默认的补丁路径**不调它**：补丁本来就一个字节都不动主数据，留底无从谈起。
     """
     p = Path(path)
     if not p.exists():
@@ -1212,32 +1309,47 @@ def _json_rows(path):
         return 0
 
 
-def _save_rows(rows, out=ONLINE_OUT):
+def _save_rows(rows, out=ONLINE_OUT, extra=None):
     """把已采的角色增量写盘：原子替换（先写临时文件再 rename），中途中断不丢、不坏。
 
     out 可覆盖，供 correct_gui.py 复用同一套落盘格式（默认值保证采集路径行为不变）。
+
+    extra 是**顶层兄弟键**，补丁路径用（见 ICONS_KEY）；--replace 路径 extra=None。
+    刻意不写进行里：行的键集是给下游的契约（`数据说明.md`），而且 correct_gui.normalize_row
+    会把行里不认识的键静默丢掉 —— 塞进行里既带不过去、又有漏进主数据的风险。
+    extra 为 None 时输出与旧版逐字节相同。
     """
+    data = {"角色": rows}
+    if extra:
+        data.update(extra)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(out) + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"角色": rows}, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(out)
 
 
-def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False, asserts=None,
+def collect_online(engine, screen, max_chars=500, save_shots=False, replace=False, asserts=None,
                    with_icons=True):
     """在线循环采集：停在信息页，翻页直到 LV.1。save_shots=True 时每页截图存 output/shots/。
 
-    patch=True 走**增量（补丁）模式**，与全量只差两处，但两处都要命：
-      * 结果写 PATCH_OUT，**主数据一个字节都不动** —— 补丁要经 correct_gui 人工仲裁后才并进去。
-        错名/误判因此永远污染不了主数据。
-      * **不归档主数据**。_archive_previous 在全量路径上是无条件执行的，增量跑也照做的话，
-        每次增量都会把主 JSON 改名留底、腾出位置 —— 那是全量的语义，不是增量的。
+    **默认写补丁**（PATCH_OUT + 顶层 `_图标`）：主数据 ONLINE_OUT **一个字节都不动** ——
+    补丁要经 correct_gui 合并后才并进去，错名/误判因此永远污染不了主数据。扫多少只是范围
+    不同（max_chars 小 = 增量重扫，大 = 全量，遇 LV.1 自动停），后面「对比旧表 → 更新/照旧/
+    追加」是同一件事，所以这里没有「增量/全量」两套代码。
+
+    replace=True 是**逃生口**（换号 / 砍掉重练）：归档主数据后用本次结果整个替换它。
+    界面不可达，只能手打 --replace。这条路径不写 `_图标`（extra=None，输出与旧版逐字节相同），
+    也正因为它是唯一会**整表覆盖**的路径，才必须显式。
     asserts 是 --as 给的身份断言，**按扫描顺序一一对应**（见 name_matches）。
     with_icons=True 时用信息页那四个图标独立定名（见 resolve_icons），--no-icons 可关掉。
     """
     rows = []
-    out = PATCH_OUT if patch else ONLINE_OUT
+    icon_records = []          # 与 rows 同下标；随补丁落盘（见 ICONS_KEY）
+    out = ONLINE_OUT if replace else PATCH_OUT
+    # 顶层兄弟键。字典里放的是 icon_records 这个**引用**，所以它随循环增长、无需重建。
+    # replace 路径 extra=None —— 主数据输出与旧版逐字节相同。
+    extra = None if replace else {ICONS_KEY: icon_records}
     asserts = [a for a in (asserts or []) if a]
     roster = load_roster_names() if asserts else None
     stat_table = load_stat_table()
@@ -1252,28 +1364,28 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False,
         attrs = load_roster_attrs()
         if not roster_full or not attrs:
             icon_tpl = None
-            print(f"⚠️⚠️ 图鉴读不到（{rerr}），**图标定名整条关闭** —— "
+            print(f"⚠️⚠️ 图鉴读不到（{rerr}），图标定名整条关闭 —— "
                   f"本次每一行都会退回 OCR 原名，实测约四成会读错。")
         else:
             print(f"图标定名已就绪：{sum(len(v) for v in ICON_VALUES.values())} 个模板，图鉴 {len(attrs)} 人。")
     shots_dir = Path("output/shots")
     if save_shots:
         shots_dir.mkdir(parents=True, exist_ok=True)
-    print("=== 在线模式（增量） ===" if patch else "=== 在线模式（全量） ===")
-    if patch:
-        print(f"结果写 {out}；主数据 {ONLINE_OUT} 不动，留给 correct_gui 合并（也不会被归档）。")
-    else:
+    print("=== 在线模式（替换主数据） ===" if replace else "=== 在线模式（补丁） ===")
+    if replace:
         n_before = _json_rows(ONLINE_OUT)
         prev = _archive_previous(ONLINE_OUT)
         if prev:
             print(f"（上一轮结果已留底：{prev}）")
         if n_before and max_chars < n_before:
-            # 这个坑踩过两次了：`--max 3` 看着人畜无害，其实全量路径是「归档 + 整个替换」，
-            # 一跑就把 52 行的主数据换成 3 行。留底能救回来，但前提是你**先发现**。
-            print(f"⚠️ 主数据原有 {n_before} 行，本次 --max {max_chars} 只会采 {max_chars} 行的量，"
-                  f"结果会**替换**掉那 {n_before} 行（旧文件已留底，可还原）。\n"
-                  f"   只是想更新个别角色的话，请改用 --patch —— 它一个字节都不动主数据，"
+            # --replace 是唯一会整表覆盖的路径，界面不可达，但手打时仍要拦一下：
+            # `--max 3` 看着人畜无害，一跑就把 52 行的主数据换成 3 行。
+            print(f"⚠️ --replace 会整个替换主数据：原有 {n_before} 行，本次只采 {max_chars} 行的量，"
+                  f"其余 {max(n_before - max_chars, 0)} 行会消失（旧文件已留底，可还原）。\n"
+                  f"   只想更新个别角色的话去掉 --replace —— 默认就写补丁，一个字节都不动主数据，"
                   f"跑完在 correct_gui 里合并。")
+    else:
+        print(f"结果写 {out}；主数据 {ONLINE_OUT} 不动，留给 correct_gui 合并（也不会被归档）。")
     if asserts:
         # 手打错字在这里就要报出来：等扫完再发现，白等几分钟
         if roster is not None:
@@ -1332,7 +1444,7 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False,
             if icons:
                 bad = icons_agree(name, icons, attrs)
                 if bad not in (None, True):
-                    print(f"    ❌❌ 图标与断言不符：**{bad}** 这一维图标读的是「{icons[bad][0]}」，"
+                    print(f"    ❌❌ 图标与断言不符：「{bad}」这一维图标读的是「{icons[bad][0]}」，"
                           f"而「{name}」在图鉴里是「{attrs[name][bad]}」。"
                           f"断言错一格后面全会错位 —— 立即中止，请重跑。")
                     break
@@ -1353,12 +1465,26 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False,
             break
 
         slots = {}
+        drifted = False     # 采到一半屏幕换人了：这一行整个作废，别再往下点
+        checked = False     # 换人复核只做第一槽之前那一处（成本与理由见 _confirm_same_char）
         for slot, xy in SLOTS.items():
             # 每次点击前先确认还在信息页：错位了当场纠正，而不是等某个布尔变真
             if not _ensure_info(screen, xy, tries=3, timeout=5.0):
                 print(f"    {slot}: 无法回到信息页（判定={page_state(screen.grab())}），中断。")
                 slots[slot] = _empty_slot()
                 break
+
+            if not checked:
+                checked = True
+                if cp is not None:
+                    same, now_cp = _confirm_same_char(screen, engine, cp)
+                    if not same:
+                        print(f"    ❌❌ 点「{slot}」之前屏幕就换人了：这一行是「{name}」"
+                              f"（战力 {cp}），现在读到的是 {now_cp if now_cp is not None else '读不出'}。"
+                              f"翻页动画在采集途中才走完 —— 再点下去会把**下一个角色的装备**"
+                              f"记到「{name}」头上。本行作废，立即中止，请重跑。")
+                        drifted = True
+                        break
 
             # 点槽开浮层；偶发点击失效则重试一次
             screen.click(xy)
@@ -1398,8 +1524,14 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False,
                 _ensure_info(screen, xy, tries=2, timeout=5.0)
             time.sleep(0.2)  # 返回后缓冲，避免紧接着点下一槽太快
 
+        if drifted:
+            # 身份与装备对不上的一行**整个丢掉**：补丁里宁可少一行，也不能多一行错的
+            # （错行一旦并进主数据，会靠合并的「空槽保留旧值」一直活着，见莱伊·甲）。
+            break
+
         rows.append(build_row(name, cp, slots))
-        _save_rows(rows, out)  # 每采完 1 角色就落盘，中断不丢
+        icon_records.append(_icon_record(icons))   # 必须与 rows 同步 append，否则下标错位
+        _save_rows(rows, out, extra=extra)  # 每采完 1 角色就落盘，中断不丢
 
         if level == 1:
             print(f"到达 LV.1（{name}），采集完成，停止。")
@@ -1421,10 +1553,13 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, patch=False,
             break
         turned = True   # 翻页后图标读数要双帧确认，见 read_icons_stable
 
-    _save_rows(rows, out)
+    _save_rows(rows, out, extra=extra)
     print(f"\n采集 {len(rows)} 个角色，已写入 {out}")
-    if patch:
-        print("这是**补丁**，主数据没动。开 correct_gui.py 走「合并补丁」人工确认后才会并进去。")
+    if replace:
+        print(f"⚠️ --replace：主数据 {ONLINE_OUT} 已被本次结果整个替换（旧文件已留底）。")
+    else:
+        print(f"这是补丁，主数据没动。界面里点「采集…」跑完会自动接上合并"
+              f"（每一条都列在合并窗里，四维唯一的已预选好、可改）；命令行老路可走「合并补丁」。")
     return {"角色": rows}
 
 
@@ -1438,16 +1573,29 @@ def main():
     ap.add_argument("--max", type=int, default=500, help="在线模式最大采集角色数（兜底）")
     ap.add_argument("--save-shots", action="store_true", help="在线采集时每页截图存 output/shots/（调试用）")
     ap.add_argument("--patch", action="store_true",
-                    help=f"增量模式：结果写 {PATCH_OUT}，主数据 {ONLINE_OUT} 不动也不归档")
+                    help=f"兼容别名：结果写 {PATCH_OUT}。现在不写它也是这个行为，"
+                         f"主数据 {ONLINE_OUT} 不动也不归档")
+    ap.add_argument("--replace", action="store_true",
+                    help=f"⚠️ 逃生口：归档后用本次结果整个替换主数据 {ONLINE_OUT}。"
+                         f"只有换号 / 砍掉重练才用；默认（写补丁）安全得多，界面里也不可达")
     ap.add_argument("--as", dest="asserts", default="", metavar="名字[,名字…]",
                     help="按扫描顺序断言身份，如 --as '红莲：暗影,桃乐丝'。人就在游戏里看着屏幕，"
-                         "比 OCR 可靠；只在增量模式下有意义，给了它会自动等于 --patch")
+                         "比 OCR 可靠。已废弃，只在图标定不下来时当逃生口用")
     ap.add_argument("--no-icons", action="store_true",
                     help="关掉「用信息页那四个图标独立定名」。逃生开关，正常情况下不用它 —— "
                          "关掉之后姓名就只剩 OCR 一条路，实测约四成会读错")
     ap.add_argument("--check-state", action="store_true",
                     help="只校验页面状态分类器（不采集、不加载 OCR）：根目录样本 + output/shots/*.png")
     args = ap.parse_args()
+
+    # 全角/半角逗号都认：手打的时候没人会去想用的是哪一种
+    asserts = [s.strip() for s in re.split(r"[,，]", args.asserts) if s.strip()]
+    if args.replace and (args.patch or asserts):
+        # 语义打架：--replace 要整表覆盖，而 --patch / --as 是补丁语义。手打错了就直说。
+        # 放在最前面：打错字不该先白等一次 OCR 引擎加载才知道。
+        print("✗ --replace 不能和 --patch / --as 一起用 —— --replace 是整表替换，"
+              "那两者是补丁语义。二选一。")
+        sys.exit(2)
 
     if args.check_state:
         # 根目录这 6 张是本地标定样本（不入库），换机器时缺失会被跳过；
@@ -1468,15 +1616,9 @@ def main():
     if args.offline:
         collect_offline(engine, args.ps, args.eq)
     else:
-        # 全角/半角逗号都认：手打的时候没人会去想用的是哪一种
-        asserts = [s.strip() for s in re.split(r"[,，]", args.asserts) if s.strip()]
-        patch = args.patch
-        if asserts and not patch:
-            patch = True
-            print("（--as 只在增量模式下有意义，已自动切到 --patch）")
         screen = Screen(offline=False)
         collect_online(engine, screen, max_chars=args.max, save_shots=args.save_shots,
-                       patch=patch, asserts=asserts, with_icons=not args.no_icons)
+                       replace=args.replace, asserts=asserts, with_icons=not args.no_icons)
 
     del engine
 
