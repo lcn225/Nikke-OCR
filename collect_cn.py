@@ -540,6 +540,86 @@ def _read_affix_values(engine, img, name_rows, table, dy=0):
 
 
 # ----------------------------------------------------------------------------
+# 数值像素校验：OCR 之外的第二条证据
+# ----------------------------------------------------------------------------
+# 动机：align_affix_value 会把读不准的结果**吸附到最近的合法档位**，于是"没把握"被静默
+# 转成"自信的错值"，而词条表校验**按设计拦不住**（错值也是合法档位）。2026-10-07 全量
+# 离线重放实测：主数据 636 格里有 8 格这么错（把 11.81% 记成 11.11%、把 6.18% 记成 6.88%）。
+#
+# 手段：数值文字的字形宽度是稳的（亚像素渲染动不了它，实测同字符极差 ≤1px），
+# 所以可以按记录值逐字符比宽度，对不上就报警。
+#
+# **能做什么**：检出 **'1' 与宽字形之间**的误读 —— 实测 8 个真错（11.81% 被记成 11.11%、
+#   6.18% 被记成 6.88%）全属此类；在 output/shots/ 265 张带标签语料上命中 8/8、误报 0。
+# **不能做什么**（别把话说大）：说不出正确值是多少（'6' 与 '8' 同宽），所以**只能报警、
+#   不能纠正**；也检不出同宽数字之间（'6'↔'8'、'0'↔'2'）的误读。
+#   '7'(10px)↔'0'(11px) 也检不出：只差 1px，而 GLYPH_W_TOL 是留给字体/网格漂移的余量
+#   （实测同字符极差 1px）。为了多抓这 1px 而收到 TOL=1 不划算 —— 换来的假警报要人
+#   一条条看，比漏掉那个尚未被观测到的错法代价更大。
+#
+# ⚠️ 宽度表只对当前这个字体/字号 + **当前裁框**（AFFIX_VAL_BAND、行 y±18）成立：
+#    同字符极差 1px，换裁框就会整体偏 1px。游戏改 UI 后要连同裁框一起重标。
+GLYPH_W = {"1": 4, "7": 10, "0": 12, "2": 12, "3": 12, "4": 12, "5": 12,
+           "6": 12, "8": 12, "9": 12, ".": 1, "%": 15}   # 130 串标定，众数占比 95~100%
+GLYPH_W_TOL = 3     # 实测同字符极差 ≤1px（'1' 3~4、'0' 11~12、'%' 14~15），取 3 留余量
+
+
+def _val_glyph_widths(img, y_row, dy=0):
+    """该词条行的数值文字 -> 各字形宽度 [px]（左起）。量不到返回 []。"""
+    x0, y0, x1, y1 = _shift(AFFIX_VAL_BAND, dy)
+    crop = img.crop((x0, int(y_row) - 18, x1, int(y_row) + 18)).convert("L")
+    m = np.array(crop).astype(int) < 140
+    # 裁框里有一条贯穿全宽的 UI 分隔线（行边界）。不剔掉，紧包围盒会被它撑满整幅宽度，
+    # 后面按列切分就全乱 —— 实测每个裁框都恰好命中 1 行。
+    m[m.mean(axis=1) > 0.8] = False
+
+    cols = m.any(axis=0)
+    runs, start = [], None
+    for x, v in enumerate(cols):
+        if v and start is None:
+            start = x
+        if not v and start is not None:
+            runs.append((start, x - 1)); start = None
+    if start is not None:
+        runs.append((start, len(cols) - 1))
+    if len(runs) < 2:
+        return []
+    # 直接取**全部**列段：裁框用的是项目自己的数值列取值域 AFFIX_VAL_BAND，左侧那些
+    # 与本题无关的孤立墨点本来就在窗外。
+    # ⚠️ 别在这里加"按最大间隙切一刀丢掉左边"的启发式 —— 那是在宽窗（x940~1140）上
+    # 才需要的补丁；换成窄窗后杂点消失，最大间隙落到了 '.' 与 '%' 之间，
+    # 反而会把 11.81% 切成 [4, 15] 两段（实测踩过）。
+    return [b - a + 1 for a, b in runs]
+
+
+def verify_affix_values(img, name_rows, values, dy=0):
+    """按像素字形宽度复核每行的数值读数 -> [True(可疑) / False(相符) / None(不适用)] × 3。
+
+    **它不是在识别，是在找矛盾**：说不出正确值是多少，只能说"这串字的形状配不上这个数"。
+
+    None 的三种情形都是**无从校验**、不是"校验失败"，所以不报警：
+      * 该行没有数值（空槽 / 补位 / 漏读）
+      * 该行是**暗底**（第 15 档）—— 那一档的值由**背景颜色**直接定（见 _row_style），
+        根本不经过 OCR，也就没有"读错"这回事
+      * 量不到墨迹，或分量数与字符数对不上 —— **宁漏勿扰**：实测这类只占 2%，
+        且已知样本全是暗底格；判可疑只会凭空造出假警报
+    """
+    out = []
+    for i, (y, name) in enumerate(name_rows):
+        v = values[i] if i < len(values) else None
+        if y is None or y < 0 or v is None or not name or name == EMPTY_AFFIX:
+            out.append(None); continue
+        if _row_style(img, y) == "dark":
+            out.append(None); continue   # 值由背景色定，不经过 OCR
+        expect = f"{v * 100:.2f}%"
+        got = _val_glyph_widths(img, y, dy)
+        if len(got) != len(expect):
+            out.append(None); continue
+        out.append(any(abs(GLYPH_W[c] - w) > GLYPH_W_TOL for c, w in zip(expect, got)))
+    return out
+
+
+# ----------------------------------------------------------------------------
 # 装备等级反推：读装备能力值 -> (类型, 槽位, T10) 查表映射 0~5
 # ----------------------------------------------------------------------------
 # 装备页顶部类型标签（火力型/辅助型/防御型）。位置按面板顶标定：实测在 面板顶+37。
@@ -562,6 +642,14 @@ PATCH_OUT = "output/cn_patch.json"              # 采集产出（补丁）；**�
 # **刻意放顶层而不是塞进行里**：行的键集是对下游的契约（数据说明.md），且 correct_gui
 # 的 normalize_row 会丢掉行里不认识的键 —— 塞进去既带不过去又会漏进主数据。
 ICONS_KEY = "_图标"
+# 第二个顶层兄弟键：数值的**像素校验**结果（见 verify_affix_values）。
+# 与「角色」同下标，每条是 {寻址键: 该格被标时的数值} 或 None。寻址键对齐 correct_gui 的
+# Prob.col（1 基，如 "头1值"）。
+# **值随标记一起存**是这个设计的要点：界面只在「当前数值 == 标记里的数值」时才显示可疑，
+# 于是**改对之后标记自动失效**，不需要任何清标记的钩子。
+# 同样刻意放顶层不进行里（理由见上面 ICONS_KEY），且这条要跟着主数据长期存活，
+# 不像 _图标 用完即弃 —— 所以 correct_gui 侧另有持久化处理。
+SUSPECT_KEY = "_可疑"
 ROSTER_PATH = "docs/chacters.json"              # 图鉴（姓名 -> 属性/企业/武器/职业），只拿姓名当名单
 
 _TYPES = ["火力型", "辅助型", "防御型"]
@@ -711,7 +799,10 @@ def infer_level(stats, typ, slot, table):
 
 
 def read_equip_page(engine, img, slot=None, stat_table=None):
-    """装备页 -> (等级, [词条名x3], [数值x3])。
+    """装备页 -> (等级, [词条名x3], [数值x3], [可疑x3])。
+
+    第 4 个元素来自 verify_affix_values（像素字形宽度复核）：
+    True=读数与字形宽度矛盾、False=相符、None=无从校验。**只报警，不改数值。**
 
     两个锚点，别混用（见文件头「装备页对齐」那段）：
       dy_top —— 面板顶：只管描述**之上**的类型标签
@@ -730,7 +821,7 @@ def read_equip_page(engine, img, slot=None, stat_table=None):
     # 空槽占位「未获得效果」算 T10 是**正确**的：T9 没有「改造装备效果」那一整块，
     # 连占位文字都读不到。反过来说，「T10 但三行全空」以前会被判成 T9 而漏读等级，现在不会。
     if not any(affix_names):
-        return None, [None, None, None], [None, None, None]
+        return None, [None, None, None], [None, None, None], [None, None, None]
 
     # T10：读类型 + 能力值 -> 查表反推等级
     level = None
@@ -742,8 +833,10 @@ def read_equip_page(engine, img, slot=None, stat_table=None):
 
     # 词条数值：按 y 对齐到 name_rows，多参数读 + 词条表校验 + 投票（仅 T10）
     affix_vals = _read_affix_values(engine, img, name_rows, load_affix_table(), dy)
+    # 第二条证据：OCR 读数照旧，另外用像素字形宽度复核一遍（只标记，不改值）
+    suspect = verify_affix_values(img, name_rows, affix_vals, dy)
 
-    return level, affix_names, affix_vals
+    return level, affix_names, affix_vals, suspect
 
 
 # ----------------------------------------------------------------------------
@@ -1168,6 +1261,18 @@ def _icon_record(icons):
     return {d: icons[d][0] for d in ICON_DIMS}
 
 
+def _suspect_record(items):
+    """[(槽, 词条下标, 该格数值)] -> {"头1值": 0.1111, ...}，供补丁携带（见 SUSPECT_KEY）。
+
+    寻址键刻意对齐 correct_gui 的 `Prob.col`（1 基，如 "头1值"），这样合并侧不必再做一层
+    位置换算就能直接拿去标记那一格。**值一起存**：界面只在当前数值仍等于它时才显示可疑，
+    于是改对之后标记自动失效。
+    """
+    if not items:
+        return None
+    return {f"{slot}{i + 1}值": v for slot, i, v in items}
+
+
 # ----------------------------------------------------------------------------
 # 采集主流程
 # ----------------------------------------------------------------------------
@@ -1267,12 +1372,15 @@ def collect_offline(engine, ps_path="ps.png", eq_path="equipment.png"):
     stat_table = load_stat_table()
     slots = {}
     for slot, _ in SLOTS.items():
-        elevel, anames, avals = read_equip_page(engine, img_eq, slot=slot, stat_table=stat_table)
+        elevel, anames, avals, asuspect = read_equip_page(
+            engine, img_eq, slot=slot, stat_table=stat_table)
         affixes = [
             {"名称": n, "数值": v} for n, v in zip(anames, avals)
         ]
         slots[slot] = {"等级": elevel, "词条": affixes}
-        print(f"  槽位[{slot}] 等级={elevel} 词条={affixes}")
+        flag = [f"{slot}{k + 1}值" for k, b in enumerate(asuspect) if b]
+        print(f"  槽位[{slot}] 等级={elevel} 词条={affixes}"
+              + (f"  ⚠️ 字形宽度不符：{flag}" if flag else ""))
 
     row = build_row(name, cp, slots)
     out = {"角色": [row]}
@@ -1352,10 +1460,11 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, replace=Fals
     """
     rows = []
     icon_records = []          # 与 rows 同下标；随补丁落盘（见 ICONS_KEY）
+    suspect_records = []       # 同上；随补丁落盘（见 SUSPECT_KEY）
     out = ONLINE_OUT if replace else PATCH_OUT
-    # 顶层兄弟键。字典里放的是 icon_records 这个**引用**，所以它随循环增长、无需重建。
-    # replace 路径 extra=None —— 主数据输出与旧版逐字节相同。
-    extra = None if replace else {ICONS_KEY: icon_records}
+    # 顶层兄弟键。字典里放的是两个 list 的**引用**，所以它们随循环增长、无需重建。
+    # replace 路径 extra=None —— 主数据输出与旧版逐字节相同（逃生口，不携带这两项）。
+    extra = None if replace else {ICONS_KEY: icon_records, SUSPECT_KEY: suspect_records}
     asserts = [a for a in (asserts or []) if a]
     roster = load_roster_names() if asserts else None
     stat_table = load_stat_table()
@@ -1471,6 +1580,7 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, replace=Fals
             break
 
         slots = {}
+        suspects = []   # [(槽, 词条下标, 数值)]，本行检出「读数与字形宽度矛盾」的格
         drifted = False     # 采到一半屏幕换人了：这一行整个作废，别再往下点
         checked = False     # 换人复核只做第一槽之前那一处（成本与理由见 _confirm_same_char）
         for slot, xy in SLOTS.items():
@@ -1512,7 +1622,8 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, replace=Fals
             eq_img = screen.grab()
             if save_shots:
                 eq_img.save(shots_dir / f"{i + 1:03d}_{slot}.png")
-            elevel, anames, avals = read_equip_page(engine, eq_img, slot=slot, stat_table=stat_table)
+            elevel, anames, avals, asuspect = read_equip_page(
+                engine, eq_img, slot=slot, stat_table=stat_table)
             if not any(anames):
                 # 浮层开着但读不到任何词条。T9 本来就没有词条（属预期），也可能是该槽无装备/
                 # 装备选择页 —— 三者输出都是空，这里不替它们下定论，记空槽并显式告警。
@@ -1521,7 +1632,15 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, replace=Fals
             else:
                 affixes = [{"名称": n, "数值": v} for n, v in zip(anames, avals)]
                 slots[slot] = {"等级": elevel, "词条": affixes}
-                print(f"    {slot}: Lv{elevel} {affixes}")
+                # 像素校验只报警、不改值；这里连带把字面值记进标记（见 _suspect_record）
+                for k, bad in enumerate(asuspect):
+                    if bad and affixes[k]["名称"] not in (None, EMPTY_AFFIX) \
+                            and affixes[k]["数值"] is not None:
+                        suspects.append((slot, k, affixes[k]["数值"]))
+                print(f"    {slot}: Lv{elevel} {affixes}"
+                      + (f"  ⚠️ 字形宽度不符："
+                         f"{[f'{s}{k + 1}值' for s, k, _ in suspects if s == slot]}"
+                         if any(bad for bad in asuspect) else ""))
 
             # 关闭浮层：点同一槽位
             screen.click(xy)
@@ -1537,6 +1656,7 @@ def collect_online(engine, screen, max_chars=500, save_shots=False, replace=Fals
 
         rows.append(build_row(name, cp, slots))
         icon_records.append(_icon_record(icons))   # 必须与 rows 同步 append，否则下标错位
+        suspect_records.append(_suspect_record(suspects))   # 同样必须锁步
         _save_rows(rows, out, extra=extra)  # 每采完 1 角色就落盘，中断不丢
 
         if level == 1:

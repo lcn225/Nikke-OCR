@@ -93,6 +93,12 @@ AFFIX_CANON = ["攻击力增加", "蓄力伤害增加", "防御力增加", "暴�
 ICON_DIMS = ("属性", "武器", "职业", "企业")
 ICON_ALIAS = {"超规格极乐净土": "极乐净土"}   # 图标值 -> 图鉴值，同 collect_cn.ICON_ALIAS
 
+# 数值的**像素校验**结果（同 collect_cn.SUSPECT_KEY，两处各留一份，--report 会比对本项）。
+# 与「角色」同下标的列表，每条是 {寻址键: 该格被标时的数值} 或 None；寻址键就是 Prob.col
+# （1 基，如 "头1值"）。**与 _图标 不同，这条是长期项**：它随主数据落盘，界面只在
+# 「当前数值 == 标记里的数值」时才显示可疑 —— 于是改对之后标记自动失效，无需清理钩子。
+SUSPECT_KEY = "_可疑"
+
 SYM = {"suspect": "▲", "warn": "!"}
 ROW_BG = {"suspect": "#ffd6a5", "warn": "#fff2cc", None: "#ffffff"}
 F_SUSPECT, F_WARN = "suspect", "warn"
@@ -139,12 +145,20 @@ def load_affix_table(path=EQUIP_XLSX):
     return table
 
 
-def save_rows(rows, out):
-    """原子写回（先写 .tmp 再 replace），格式与 collect_cn._save_rows 完全一致。"""
+def save_rows(rows, out, suspects=None):
+    """原子写回（先写 .tmp 再 replace），格式与 collect_cn._save_rows 完全一致。
+
+    suspects 为 None 时**不写** `_可疑` 键（老文件、roundtrip 都走这条，输出与旧版一致）；
+    传进来时必须是**与 rows 同长**的列表，否则宁可整条丢 —— 下标错位的标记会指到别人身上，
+    比没有标记坏得多。
+    """
     Path(out).parent.mkdir(parents=True, exist_ok=True)
+    data = {"角色": rows}
+    if suspects is not None and len(suspects) == len(rows):
+        data[SUSPECT_KEY] = suspects
     tmp = Path(str(out) + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"角色": rows}, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(out)
 
 
@@ -570,6 +584,20 @@ def load_patch_icons(path=DEFAULT_PATCH):
     return icons if isinstance(icons, list) else []
 
 
+def load_suspects(path):
+    """读文件顶层的像素校验结果（SUSPECT_KEY），按下标与「角色」对齐。
+
+    缺失/不是列表 -> []。补丁与主数据用同一个读取函数 —— 两边格式刻意做成一样。
+    越界下标由调用方按「没有标记」处理。
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    sus = raw.get(SUSPECT_KEY)
+    return sus if isinstance(sus, list) else []
+
+
 def plan_merge(main_rows, patch_rows, patch_icons, attrs, roster):
     """把补丁分成「机器已唯一确定」与「需要人看」两堆。-> (auto, ambiguous)
 
@@ -742,31 +770,74 @@ def merge_row(old_row, patch_row, empty_over=False):
     return notes
 
 
-def sort_by_cp(rows):
+def sort_by_cp(rows, companions=()):
     """按战力降序（缺战力的排最后）。游戏名册就是这个序。
 
     ⚠️ 合并后**必须重排**：覆盖战力会让它在降序里的位置漂，不重排就是凭空造出一处
     「战力违反降序」，而 check_cp_order 是**成对标记相邻两行**的，会连累邻居一起报警。
     重排会让序号漂移 —— 所以确定目标行要在重排**之前**用行身份定好，之后不能再按序号引。
+
+    companions 是**与 rows 平行的列表**（如 Model.suspects），会跟着一起重排 ——
+    漏了它们就是让标记指到别人身上。
     """
-    rows.sort(key=lambda r: (r.get("战力") is None, -(r.get("战力") or 0)))
+    order = sorted(range(len(rows)),
+                   key=lambda i: (rows[i].get("战力") is None, -(rows[i].get("战力") or 0)))
+    rows[:] = [rows[i] for i in order]
+    for c in companions:
+        if len(c) == len(order):
+            c[:] = [c[i] for i in order]
 
 
-def apply_patch(rows, patch_rows, decisions):
+def _cell_value(row, col):
+    """`"头1值"` -> 那一格当前的数值；指不到就返回 None。"""
+    col = col or ""
+    digits = ""
+    for ch in col[1:]:
+        if not ch.isdigit():
+            break
+        digits += ch
+    affs = (row.get(col[:1]) or {}).get("词条") or []
+    i = int(digits) - 1 if digits else -1
+    return affs[i].get("数值") if 0 <= i < len(affs) else None
+
+
+def _prune_suspects(sus, row):
+    """丢掉「该格当前值已不等于标记里存的值」的项 —— 标记只为它被提出时那个值负责。
+
+    与 check_row 里「只在 suspects.get(col) == v 时才报」是同一套语义，两处都由值驱动。
+    值一被改掉（改对或改成别的）标记即失效。
+    """
+    if not sus:
+        return None
+    return {c: v for c, v in sus.items() if _cell_value(row, c) == v} or None
+
+
+def apply_patch(rows, patch_rows, decisions, patch_suspects=None, row_suspects=None):
     """按 decisions 把补丁并进 rows（**原地**，重排由调用方做）。返回 (新增数, 覆盖数, [说明])。
 
     decisions: {补丁行下标: (目标旧行下标, 空槽是否覆盖)}；**不在里面的按跳过处理**，
     目标下标为 None 表示「作为新角色追加」。
+
+    patch_suspects / row_suspects 是补丁侧与主数据侧的像素校验标记（见 SUSPECT_KEY），
+    两边都按「与各自行列表同下标」处理。**补丁里被标可疑的格，合并后标记必须原样带过去**
+    —— 那正是要被复核的值，标记在合并这一步丢掉就等于白标了。
     """
     added = over = 0
     notes = []
+    if row_suspects is not None and len(row_suspects) != len(rows):
+        row_suspects = None      # 长度对不上就整个放弃，宁可无标记也不要错位
     for i, pr in enumerate(patch_rows):
         if i not in decisions:
             continue
         target, empty_over = decisions[i]
         name = pr.get("姓名") or "(空)"
+        ps = patch_suspects[i] if patch_suspects and i < len(patch_suspects) else None
+        if not isinstance(ps, dict):
+            ps = None
         if target is None:
             rows.append(copy.deepcopy(pr))
+            if row_suspects is not None:
+                row_suspects.append(_prune_suspects(ps, rows[-1]))
             added += 1
             notes.append(f"[{i + 1}] {name}：追加为新角色")
             continue
@@ -774,6 +845,14 @@ def apply_patch(rows, patch_rows, decisions):
             notes.append(f"[{i + 1}] {name}：目标行 {target} 越界，已跳过")
             continue
         ns = merge_row(rows[target], pr, empty_over)
+        if row_suspects is not None:
+            # **并集 + 按当前值剪枝**，不是整条替换：
+            #   * 补丁这一行没标的格，可能因为「补丁该槽为空 → merge_row 保留旧值」而
+            #     标记仍然有效，整条替换会把这种旧标记误删（等于合并时丢了警告）
+            #   * 值已被改掉的标记则应当失效 —— 交给 _prune_suspects 按值剪掉
+            merged = dict(row_suspects[target] or {})
+            merged.update(ps or {})
+            row_suspects[target] = _prune_suspects(merged, rows[target])
         over += 1
         notes.append(f"[{i + 1}] {name} → 覆盖 #{target + 1} {rows[target].get('姓名') or '(空)'}"
                      + (f"（{'；'.join(ns)}）" if ns else ""))
@@ -788,12 +867,19 @@ def merge_preview(main_path, patch_path):
     m = build_model(main_path, verbose=False)
     prows, notes = load_rows(patch_path)
     icons = load_patch_icons(patch_path)
+    suspects = load_suspects(patch_path)
     auto, ambiguous = plan_merge(m.rows, prows, icons, load_roster_attrs(), m.roster)
     entries = merge_entries(prows, auto, ambiguous)
     print(f"主数据 {main_path}：{len(m.rows)} 行")
     print(f"补丁   {patch_path}：{len(prows)} 行" + (f"（结构异常 {len(notes)} 处）" if notes else "")
           + (f"，其中 {len(icons)} 条带图标读数" if icons else "（没有图标读数，"
              f"全部退回姓名判定）"))
+    n_sus = sum(len(s) for s in suspects if isinstance(s, dict))
+    if n_sus:
+        print(f"⚠️ 补丁里有 {n_sus} 格的数值与截图上该数值的字形宽度对不上（须对着游戏核）：")
+        for i, s in enumerate(suspects):
+            if isinstance(s, dict) and s:
+                print(f"     [{i + 1}] {prows[i].get('姓名') or '(空)'}：" + "、".join(s))
     n_auto = sum(1 for _i, k, _t, _w, _p in entries if k == "auto")
     print(f"\n=== 全部 {len(entries)} 条都会出现在合并窗里（{n_auto} 条已由图标预选好，"
           f"{len(entries) - n_auto} 条要你定），逐条如下 ===")
@@ -818,8 +904,12 @@ def merge_preview(main_path, patch_path):
     return 0
 
 
-def check_row(row, affix_table, name_counts, roster):
-    """一行的全部问题 -> [Prob]。short 带位置，col 指到出问题的那一列。"""
+def check_row(row, affix_table, name_counts, roster, suspects=None):
+    """一行的全部问题 -> [Prob]。short 带位置，col 指到出问题的那一列。
+
+    suspects 是这一行的像素校验标记 {寻址键: 该格被标时的数值}（见 SUSPECT_KEY）。
+    **只在当前数值仍等于标记里的数值时才报** —— 值一被改对，标记自动失效。
+    """
     probs = list(check_name(row.get("姓名"), roster))
 
     cp = row.get("战力")
@@ -857,20 +947,28 @@ def check_row(row, affix_table, name_counts, roster):
                 if v is None:
                     probs.append(Prob(F_SUSPECT, "数值漏读", f"{tag}数值漏读",
                                       f"{tag} {n} 的数值没读出来", f"{tag}值"))
-                elif affix_table:
-                    levels = affix_table.get(n)
-                    if levels and not tier_hit(levels, v):
-                        near = min(levels, key=lambda x: abs(x - v))
-                        probs.append(Prob(F_WARN, "数值越档", f"{tag}数值越档",
-                                          f"{tag} {n} = {fmt_pct(v)} 不在合法档位"
-                                          f"（最近 {fmt_pct(near)}）", f"{tag}值"))
+                else:
+                    if affix_table:
+                        levels = affix_table.get(n)
+                        if levels and not tier_hit(levels, v):
+                            near = min(levels, key=lambda x: abs(x - v))
+                            probs.append(Prob(F_WARN, "数值越档", f"{tag}数值越档",
+                                              f"{tag} {n} = {fmt_pct(v)} 不在合法档位"
+                                              f"（最近 {fmt_pct(near)}）", f"{tag}值"))
+                    # 像素校验：OCR 说这个值，像素说字形宽度配不上它。**两条证据互相矛盾**
+                    # 时以"要有人看"为准 —— 采集侧校不出正确值是多少（'6' 与 '8' 同宽），
+                    # 所以这里只报警、不改值。这正是词条表挡不住的那一类错（错值也合法）。
+                    if suspects and suspects.get(f"{tag}值") == v:
+                        probs.append(Prob(F_SUSPECT, "字形不符", f"{tag}字形不符",
+                                          f"{tag} {n} = {fmt_pct(v)} 与截图上该数值的字形宽度"
+                                          f"对不上（须对着游戏核）", f"{tag}值"))
     return probs
 
 
 class Model:
     """把行 + 校验结果打包在一起，界面只跟它打交道。"""
 
-    def __init__(self, rows, affix_table, roster, roster_err=None):
+    def __init__(self, rows, affix_table, roster, roster_err=None, suspects=None):
         # 一律先归一化：保住「Model.rows 永远是规范形状」这条不变量
         self.rows = []
         for r in rows:
@@ -878,6 +976,12 @@ class Model:
             self.rows.append(nr if nr is not None
                              else dict({"姓名": None, "战力": None},
                                        **{s: empty_slot() for s in GUI_SLOTS}))
+        # 与 rows **平行**的像素校验标记（见 SUSPECT_KEY）。缺的补 None，多的丢掉 ——
+        # 但这个平行关系必须守住：错位的标记会指到别人身上。sort_by_cp 与 apply_patch
+        # 都按这条不变量处理它。
+        sus = suspects or []
+        self.suspects = [sus[i] if i < len(sus) and isinstance(sus[i], dict) else None
+                         for i in range(len(self.rows))]
         self.affix_table = affix_table
         self.roster = roster
         self.roster_err = roster_err
@@ -888,6 +992,13 @@ class Model:
         self.recompute()
 
     def recompute(self):
+        # 「可疑标记与行**同下标平行**」是这份实现的核心不变式（sort_by_cp / apply_patch
+        # 都靠它）。它一旦被破坏，标记会静默指到别人身上 —— 比没有标记坏得多。
+        # 这里自愈 + 响亮告警：宁可丢掉全部标记，也不要留下错位的。
+        if len(self.suspects) != len(self.rows):
+            print(f"⚠️ 可疑标记与行数不平行（{len(self.suspects)} vs {len(self.rows)}）"
+                  f"—— 已全部丢弃（错位的标记会指到别人身上）")
+            self.suspects = [None] * len(self.rows)
         counts = {}
         for r in self.rows:
             nm = r.get("姓名")
@@ -896,7 +1007,7 @@ class Model:
         self.cp_order = check_cp_order(self.rows)
         self.problems = []
         for i, r in enumerate(self.rows):
-            probs = check_row(r, self.affix_table, counts, self.roster)
+            probs = check_row(r, self.affix_table, counts, self.roster, self.suspects[i])
             if i in self.cp_order:
                 probs.append(Prob(F_SUSPECT, "战力存疑", "战力存疑", self.cp_order[i], "战力"))
             self.problems.append(probs)
@@ -914,6 +1025,10 @@ class Model:
     def marked_cols(self, i):
         """这一行里「被指到」的列 —— 那些格子会显示成 `?`。"""
         return {p.col for p in self.problems[i] if p.col}
+
+    def suspect_cols(self, i):
+        """被**像素校验**标出的列。与漏读区分开：这些格子**有值**，只是值可疑。"""
+        return {p.col for p in self.problems[i] if p.code == "字形不符" and p.col}
 
     def problem_text(self, i):
         probs = self.problems[i]
@@ -958,7 +1073,7 @@ def build_model(path, verbose=True):
         print(f"  词条表：{'9 词条' if table else terr}")
         print(f"  图鉴：{len(roster['keys']) if roster else 0} 人"
               + ("" if roster else f"（{rerr}，姓名校验已关闭）"))
-    m = Model(rows, table, roster, rerr)
+    m = Model(rows, table, roster, rerr, suspects=load_suspects(path))
     m.notes = notes
     return m
 
@@ -987,6 +1102,9 @@ def check_consistency():
     if getattr(cc, "ICONS_KEY", None) != "_图标":
         ok = False
         print(f"  ✗ ICONS_KEY 不一致：{getattr(cc, 'ICONS_KEY', None)!r} vs '_图标'")
+    if getattr(cc, "SUSPECT_KEY", None) != SUSPECT_KEY:
+        ok = False
+        print(f"  ✗ SUSPECT_KEY 不一致：{getattr(cc, 'SUSPECT_KEY', None)!r} vs {SUSPECT_KEY!r}")
     ours = load_affix_table(EQUIP_XLSX)
     theirs = cc.load_affix_table(EQUIP_XLSX)
     if ours != theirs:
@@ -994,7 +1112,7 @@ def check_consistency():
         ok = False
         print(f"  ✗ 词条表解析结果不一致：{diff}")
     print("  ✓ 与 collect_cn 一致（AFFIX_CANON / EMPTY_AFFIX / ICON_DIMS / ICON_ALIAS / "
-          "ICONS_KEY / 词条表解析）" if ok else "  ↑ 需要修正")
+          "ICONS_KEY / SUSPECT_KEY / 词条表解析）" if ok else "  ↑ 需要修正")
     return ok
 
 
@@ -1028,10 +1146,13 @@ def report(path):
 
 def roundtrip(path):
     m = build_model(path, verbose=False)
-    orig = json.loads(Path(path).read_text(encoding="utf-8"))["角色"]
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    orig = raw["角色"]
+    had_sus = SUSPECT_KEY in raw                # 源文件没有这个键时就不要凭空写出来
     tmp = Path("output/_roundtrip_check.json")
-    save_rows(m.rows, tmp)
-    written = json.loads(tmp.read_text(encoding="utf-8"))["角色"]
+    save_rows(m.rows, tmp, m.suspects if had_sus else None)
+    written_raw = json.loads(tmp.read_text(encoding="utf-8"))
+    written = written_raw["角色"]
     back, _ = load_rows(tmp)
     tmp.unlink()
     same_struct, same_model, same_orig = written == m.rows, back == m.rows, orig == m.rows
@@ -1039,6 +1160,10 @@ def roundtrip(path):
     print(f"写出结构与模型一致: {same_struct}")
     print(f"读回与模型一致    : {same_model}")
     print(f"与原始文件完全一致: {same_orig}")
+    if had_sus:
+        same_sus = written_raw.get(SUSPECT_KEY) == raw.get(SUSPECT_KEY)
+        print(f"可疑标记往返一致  : {same_sus}")
+        same_orig = same_orig and same_sus
     if not same_orig:
         for i, (a, b) in enumerate(zip(orig, m.rows)):
             if a != b:
@@ -1981,6 +2106,9 @@ class App:
         if spec.kind == "ro":
             return self.model.problem_text(rid), FG_MARK if self.model.level_of(rid) else "#666666"
         txt = render_cell(self.model.rows[rid], spec)
+        # 有值但像素校验存疑：**照常显示数值**、只把字标红 —— 标成 `?` 会让人误以为没读到值
+        if spec.col_id in self.model.suspect_cols(rid):
+            return txt, FG_MARK
         marked = spec.col_id in self.model.marked_cols(rid)
         if not txt and marked:
             return "?", FG_MARK
@@ -2086,7 +2214,7 @@ class App:
             self.backup = archive_previous(self.path)
             self.archived = True
         try:
-            save_rows(self.model.rows, self.path)
+            save_rows(self.model.rows, self.path, self.model.suspects)
         except Exception as e:
             messagebox.showerror("写盘失败", f"{type(e).__name__}: {e}")
             self.flash(f"写盘失败：{e}", "err")
@@ -2204,11 +2332,12 @@ class App:
 
         返回是否成功。**先重排再写盘**：补丁换了战力，不重排就是造一处假的「违反降序」。
         """
-        added, over, notes = apply_patch(self.model.rows, patch_rows, decisions)
-        sort_by_cp(self.model.rows)
+        added, over, notes = apply_patch(self.model.rows, patch_rows, decisions,
+                                         load_suspects(patch_path), self.model.suspects)
+        sort_by_cp(self.model.rows, companions=[self.model.suspects])
         try:
             self.backup = archive_previous(self.path)
-            save_rows(self.model.rows, self.path)
+            save_rows(self.model.rows, self.path, self.model.suspects)
         except Exception as e:
             messagebox.showerror("写盘失败", f"{type(e).__name__}: {e}\n"
                                              f"（模型已改但没落盘，重载即可回到磁盘上的状态）")
