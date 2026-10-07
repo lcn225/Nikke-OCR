@@ -2423,6 +2423,17 @@ def main():
                     help="不开窗，只打印补丁会怎么合并（干跑，不写任何文件）")
     args = ap.parse_args()
 
+    # 控制台编码不一定是 UTF-8（本机是 GBK），而下面的输出用了 ✓ / ✗ / ⚠ 这类符号。
+    # U+2713 不在 GBK 里，print 会直接抛 UnicodeEncodeError —— 崩在收尾那一行，
+    # 命令以非零码退出，看上去像数据坏了（其实结论都已经打出来了）。
+    # 降级成 replacement 字符即可：符号退化成 ?，结论一个字不少。
+    # 打包成 exe（无控制台）时 stdout 可能是 None，reconfigure 属性也不保证存在，兜住。
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
     # 所有相对路径（output/、equipment.xlsx、docs/）都依赖 cwd，先切到脚本目录
     os.chdir(Path(__file__).resolve().parent)
 
