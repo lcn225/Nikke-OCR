@@ -483,8 +483,18 @@ def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18):
     有强票时只看强票，弱票只在完全没有强票时才轮到。
     ⚠️ 不分强弱会出错：实测 003_甲 蓄力伤害增加 有干净的 '14.63%'，但同时也冒出好几个
     乱码被表凑合成 0.0477 的候选，票数更多就把正确值投掉了 ——「候选更多」反而更糟。
+
+    **第二层：精确票压吸附票**（2026-10-08 加，强/弱之内再分）。**精确票** = 原文本身就是
+    该词条某个档位的标准值（'11.81%' -> 0.1181 就在档位表里）；**吸附票** = 原文不是任何
+    档位值、被 align_affix_value 拉到最近的合法档位（'11.95%' -> 0.1234、'11.01%' -> 0.1111）。
+    依据是 2026-10-07 的 5 格像素裁决：**精确票全对、吸附票全错**。最典型的是 #037 雪子
+    手[0]：慢路径上吸附票 5 : 精确票 3，多数票本身是错的（0.1234），精确优先后翻回真值 0.1795。
+    ⚠️ 这条**只作用在多候选的路径上**（2026-10-08 实测：16 图 21 格里改判 1 格，就在慢路径上）。
+    快路径 AFFIX_VAL_FAST 是单组参数，白底行实测只有一票，没有对手可压 —— 「快路径单票被吸附」
+    的错例（如 12.34% 顶掉 17.95%）得靠「胜出票是吸附来的就升级跑 ALL」才能救，尚未实现。
     """
-    strong, weak = {}, {}
+    strong, strong_snap = {}, {}   # 强票：精确 / 吸附
+    weak, weak_snap = {}, {}       # 弱票：精确 / 吸附
     for yc, t in cands:
         if abs(yc - y_row) > tol:
             continue
@@ -494,11 +504,18 @@ def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18):
         aligned = align_affix_value(name, v, table, lo, hi)
         if aligned is None:
             continue
-        bucket = strong if re.search(r"\d+\.\d+\s*%", t) else weak
+        # 精确命中时 align_affix_value 原样返回 v，吸附时才 round 到档位值；
+        # 档位表全是 4 位小数（实测 135/135），所以这个等值判断是可靠的。
+        exact = (v == aligned)
+        if re.search(r"\d+\.\d+\s*%", t):
+            bucket = strong if exact else strong_snap
+        else:
+            bucket = weak if exact else weak_snap
         bucket[aligned] = bucket.get(aligned, 0) + 1
-    if strong:
-        return max(strong, key=strong.get)
-    return max(weak, key=weak.get) if weak else None
+    for bucket in (strong, strong_snap, weak, weak_snap):
+        if bucket:
+            return max(bucket, key=bucket.get)
+    return None
 
 
 def _read_affix_values(engine, img, name_rows, table, dy=0):
