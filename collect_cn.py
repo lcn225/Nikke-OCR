@@ -476,7 +476,7 @@ def _row_style(img, y_row, dark_th=160, blue_th=0.05):
     return "blue" if ((a[:, :, 2] - a[:, :, 0]) > 30).mean() > blue_th else "normal"
 
 
-def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18):
+def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18, widths=None):
     """把候选里落在该词条行 y 附近的挑出来 -> 取值 -> 词条表校验 -> 按读取质量投票。
 
     **强票**是完整带 % 的读法（'14.63%'）；其余（掉小数点、被表硬凑回档位的）算**弱票**。
@@ -490,8 +490,13 @@ def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18):
     依据是 2026-10-07 的 5 格像素裁决：**精确票全对、吸附票全错**。最典型的是 #037 雪子
     手[0]：慢路径上吸附票 5 : 精确票 3，多数票本身是错的（0.1234），精确优先后翻回真值 0.1795。
     ⚠️ 这条**只作用在多候选的路径上**（2026-10-08 实测：16 图 21 格里改判 1 格，就在慢路径上）。
-    快路径 AFFIX_VAL_FAST 是单组参数，白底行实测只有一票，没有对手可压 —— 「快路径单票被吸附」
-    的错例（如 12.34% 顶掉 17.95%）得靠「胜出票是吸附来的就升级跑 ALL」才能救，尚未实现。
+    快路径 AFFIX_VAL_FAST 是单组参数，白底行实测只有一票，没有对手可压。
+
+    **第三层：吸附票胜出 -> 交像素宽度签名再问一次**（2026-10-09 加）。快路径单票被吸附的
+    错例（如 12.34% 顶掉 17.95%）本来打算靠「胜出票是吸附来的就升级跑 AFFIX_VAL_ALL」救，
+    但那要 ~7.5s/触发图（实测触发率 2.8%）；改用 `widths`（调用方传 `_val_glyph_widths`
+    的结果，零 OCR）后实测把这类**全修了**且零伤害：全量 250 格里触发格 改对 6 / 弄坏 0。
+    不传 `widths`（离线只喂候选的场景，如 output/tests/test_vote_exact.py）就退回纯投票。
     """
     strong, strong_snap = {}, {}   # 强票：精确 / 吸附
     weak, weak_snap = {}, {}       # 弱票：精确 / 吸附
@@ -512,9 +517,16 @@ def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18):
         else:
             bucket = weak if exact else weak_snap
         bucket[aligned] = bucket.get(aligned, 0) + 1
-    for bucket in (strong, strong_snap, weak, weak_snap):
+    for bucket, snapped in ((strong, False), (strong_snap, True),
+                            (weak, False), (weak_snap, True)):
         if bucket:
-            return max(bucket, key=bucket.get)
+            value = max(bucket, key=bucket.get)
+            if snapped:
+                # 胜出的是吸附票 -> 拿像素宽度签名再问一次（零 OCR，见 _choose_by_glyph_widths）
+                better = _choose_by_glyph_widths(name, table, lo, hi, widths)
+                if better is not None:
+                    value = better
+            return value
     return None
 
 
@@ -546,7 +558,9 @@ def _read_affix_values(engine, img, name_rows, table, dy=0):
                 out.append(levels[-1] if levels else None)
                 continue
             lo, hi = STYLE_TIERS[styles[i]]
-            out.append(_vote_row(cands, y, n, table, lo, hi))
+            # widths 是给吸附票胜出时的像素复核用的（见 _vote_row 第三层）；代价只有一次裁剪+掩码
+            out.append(_vote_row(cands, y, n, table, lo, hi,
+                                 widths=_val_glyph_widths(img, y, dy)))
         return out
 
     out = run(AFFIX_VAL_FAST)
@@ -579,6 +593,38 @@ def _read_affix_values(engine, img, name_rows, table, dy=0):
 GLYPH_W = {"1": 4, "7": 10, "0": 12, "2": 12, "3": 12, "4": 12, "5": 12,
            "6": 12, "8": 12, "9": 12, ".": 1, "%": 15}   # 130 串标定，众数占比 95~100%
 GLYPH_W_TOL = 3     # 实测同字符极差 ≤1px（'1' 3~4、'0' 11~12、'%' 14~15），取 3 留余量
+STRAY_GAP = 10      # 段间 gap 超过这个值 = 左边是裁框漏进来的杂点，不是数值（见 _val_glyph_widths）
+
+
+def _choose_by_glyph_widths(name, table, lo, hi, widths):
+    """吸附票胜出时，用**像素宽度签名**在合法档位池里挑最近邻（零 OCR）。
+
+    这是「(b) 延迟升级跑 AFFIX_VAL_ALL」的替代，2026-10-09 定案：实测触发率 2.8%
+    （6/212 图），但每张触发图要多花 ~7.5s（ALL 是 12 组参数）；宽度签名跑在**本来就
+    为它裁好的 crop** 上，约等于免费，而且比 ALL 的多数票更准 —— #020 头[1] 那格
+    FAST 与 ALL 都会偏到 0.1111，签名法一次就对。
+
+    **不唯一就弃权（margin>0 才改判）**：同宽数字（'2'/'5' 都是 12px）的签名一模一样，
+    不加这条闸，实测 250 格里会弄坏 4 格本来对的。widths 为空、或没有 2 个以上档位的
+    字符数与它一致时，同样弃权（返回 None 让调用方保持 OCR 结果）。
+
+    实测（全量 256 格，喂真候选 + 真像素，跑生产函数）：触发格 6 个全部改到真值、
+    0 弄坏；其中**实际改写 5 格**（另一格本来就对，签名法只是也指对了它）。
+    """
+    levels = table.get(name)
+    if not levels or not widths:
+        return None
+    hi = len(levels) - 1 if hi is None else min(hi, len(levels) - 1)
+    graded = []
+    for v in levels[max(0, lo):hi + 1]:
+        sig = [GLYPH_W.get(c, -1) for c in f"{v * 100:.2f}%"]
+        if len(sig) != len(widths):
+            continue
+        graded.append((sum(abs(a - b) for a, b in zip(sig, widths)), v))
+    if len(graded) < 2:
+        return None
+    graded.sort()
+    return graded[0][1] if graded[1][0] > graded[0][0] else None
 
 
 def _val_glyph_widths(img, y_row, dy=0):
@@ -601,11 +647,18 @@ def _val_glyph_widths(img, y_row, dy=0):
         runs.append((start, len(cols) - 1))
     if len(runs) < 2:
         return []
-    # 直接取**全部**列段：裁框用的是项目自己的数值列取值域 AFFIX_VAL_BAND，左侧那些
-    # 与本题无关的孤立墨点本来就在窗外。
-    # ⚠️ 别在这里加"按最大间隙切一刀丢掉左边"的启发式 —— 那是在宽窗（x940~1140）上
-    # 才需要的补丁；换成窄窗后杂点消失，最大间隙落到了 '.' 与 '%' 之间，
-    # 反而会把 11.81% 切成 [4, 15] 两段（实测踩过）。
+    # 丢裁框左缘的杂点：首个 gap > STRAY_GAP 左边的段不是数值的一部分。
+    # 这段杂点（实测宽 3~4px）是左侧相邻内容漏进裁框的残边，与真数值文字隔 31~33px，
+    # 而数值文字**内部**的段间 gap 只有 2~3px —— 两档差 10 倍，阈值取中间无歧义。
+    # ⚠️ 2026-10-09 更正：本文件早先写过"别按最大间隙切一刀丢掉左边"，那是在**宽窗**
+    # （x940~1140）时代的结论 —— 那时杂点多、最大间隙会落到 '.' 与 '%' 之间，切了反而
+    # 把 11.81% 劈成 [4, 15]。窄窗（AFFIX_VAL_BAND）下的实测反过来：杂点只剩这 1 段，
+    # 不丢段数就多 1，长度对不上 -> verify_affix_values 与签名法都只能弃权（31/250 格，
+    # 全是"优越代码伤害增加"那些行）。
+    for i in range(len(runs) - 1):
+        if runs[i + 1][0] - runs[i][1] - 1 > STRAY_GAP:
+            runs = runs[i + 1:]
+            break
     return [b - a + 1 for a, b in runs]
 
 
