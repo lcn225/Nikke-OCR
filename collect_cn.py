@@ -496,7 +496,7 @@ def _vote_row(cands, y_row, name, table, lo=0, hi=None, tol=18, widths=None):
     错例（如 12.34% 顶掉 17.95%）本来打算靠「胜出票是吸附来的就升级跑 AFFIX_VAL_ALL」救，
     但那要 ~7.5s/触发图（实测触发率 2.8%）；改用 `widths`（调用方传 `_val_glyph_widths`
     的结果，零 OCR）后实测把这类**全修了**且零伤害：全量 250 格里触发格 改对 6 / 弄坏 0。
-    不传 `widths`（离线只喂候选的场景，如 output/tests/test_vote_exact.py）就退回纯投票。
+    不传 `widths`（离线只喂候选的场景，如 tests/test_vote_exact.py）就退回纯投票。
     """
     strong, strong_snap = {}, {}   # 强票：精确 / 吸附
     weak, weak_snap = {}, {}       # 弱票：精确 / 吸附
