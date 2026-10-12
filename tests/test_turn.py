@@ -10,6 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import collect_cn as C
 
+sys.stdout.reconfigure(encoding="utf-8")   # 别让中文按 GBK 写出去
+
 C.page_state = lambda img: "info"
 C.read_cp = lambda engine, img: img.cp
 C._crop_ocr = lambda engine, img, region, scale=2: [img.name] if img.name else []

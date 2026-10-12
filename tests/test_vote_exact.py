@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO))
 
 import collect_cn as cc  # noqa: E402
 
-sys.stdout.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")   # 别让中文按 GBK 写出去
 TABLE = cc.load_affix_table(REPO / "equipment.xlsx")
 AFFIX = "攻击力增加"
 POOL = TABLE[AFFIX][:11]          # normal 配色：第 1~11 档
